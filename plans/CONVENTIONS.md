@@ -2,6 +2,15 @@
 
 These standards apply to every plan in this library unless the plan explicitly overrides them. Individual plans stay focused on *what to build*; this file defines *how we build*.
 
+## Two documents per project
+
+Every project folder contains:
+
+- **`PLAN.md`** — the *what and why*: vision, differentiation, scope, feature specs with acceptance criteria, milestones, risks.
+- **`IMPLEMENTATION.md`** — the *exactly how*: fixed decisions (names, ports, versions), full repository layout, exact dependencies, database DDL, API contracts, screen/component inventory, core-algorithm pseudocode, and ordered task lists per milestone.
+
+**Rule for implementing agents:** decisions recorded in `IMPLEMENTATION.md` §0 ("Fixed decisions") and elsewhere in that file are settled — do not re-litigate them. If something proves genuinely impossible (a library is broken, an API changed), choose the nearest equivalent, keep going, and record the deviation in the project repo's `DECISIONS.md`. Anything *not* specified in either document is yours to decide idiomatically — pick the boring option and move on; do not stop to ask.
+
 ## How plans are structured
 
 Every `PLAN.md` contains, in order:
