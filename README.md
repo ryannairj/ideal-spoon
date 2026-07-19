@@ -1,8 +1,11 @@
 # Project Ideas — Build Plan Library
 
-A collection of **31 detailed build plans**, each in its own folder under `plans/`. Every plan is written to be picked up and implemented end-to-end by an AI coding agent (or a human) without needing to come back for clarification: vision, differentiation, tech stack, architecture, data model, feature specs with acceptance criteria, milestone-by-milestone task breakdown, and testing strategy.
+A collection of **31 detailed build plans**, each in its own folder under `plans/`. Every project is specified by two documents, written to be picked up and implemented end-to-end by an AI coding agent (or a human) without needing to come back for clarification:
 
-Shared engineering standards that apply to every plan live in [`plans/CONVENTIONS.md`](plans/CONVENTIONS.md) — read that first before implementing any plan.
+- **`PLAN.md`** — the what and why: vision, differentiation, scope and non-goals, feature specs with acceptance criteria, milestones, risks.
+- **`IMPLEMENTATION.md`** — the exactly how: fixed decisions (names, libraries, versions, ports), full repository layout, exact dependencies, database DDL, API/IPC contracts, screen inventory, core-algorithm pseudocode, and ordered task lists per milestone with done-when criteria.
+
+Shared engineering standards that apply to every plan live in [`plans/CONVENTIONS.md`](plans/CONVENTIONS.md) — read that first before implementing any plan. Decisions recorded in an `IMPLEMENTATION.md` are settled: implementing agents don't re-litigate them, and log unavoidable deviations in the project's `DECISIONS.md`.
 
 ## Index
 
@@ -75,6 +78,7 @@ Shared engineering standards that apply to every plan live in [`plans/CONVENTION
 ## How to implement a plan
 
 1. Read `plans/CONVENTIONS.md`.
-2. Read the chosen plan's `PLAN.md` fully before writing code.
-3. Work milestone by milestone (M0, M1, …); each milestone is independently shippable and has acceptance criteria.
-4. Do not expand scope beyond the plan's "Non-goals" without human sign-off.
+2. Read the chosen project's `PLAN.md`, then its `IMPLEMENTATION.md`, fully before writing code.
+3. Work milestone by milestone (M0, M1, …) following the ordered task lists in `IMPLEMENTATION.md`; each milestone is independently shippable and its features have acceptance criteria in `PLAN.md`.
+4. Do not re-decide anything fixed in `IMPLEMENTATION.md`; log unavoidable deviations in `DECISIONS.md`. Anything not specified is yours — pick the boring option and keep moving.
+5. Do not expand scope beyond the plan's "Non-goals" without human sign-off.
