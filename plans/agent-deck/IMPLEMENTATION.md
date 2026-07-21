@@ -112,6 +112,12 @@ server→client: {t:'out', sessionId, dataB64} | {t:'state', sessionId, state, s
 ```
 Engine rules: detectors evaluated on ANSI-stripped output (keep raw for terminal); approval confidence = parser matched prompt AND ≥ 2 options AND options contiguous — else emit `approval_request` with `confidence:0` (UI shows raw terminal, buttons disabled).
 
+**Pack versioning strategy.** `packVersion` is a single integer (not SemVer) — it names the *pack schema contract*, not the pack's content. Rules:
+
+- The loader supports exactly the current `packVersion` (MVP: `1`). A pack whose `packVersion` is unknown/higher → skipped with a logged warning (`deck packs lint` flags it); the built-in `fallback.json` still covers that agent.
+- Editing an existing pack's regexes/labels is **not** a version bump — pack content is expected to drift as agents change their output (that's why fixtures, not code, gate packs; see §9). Content changes ship freely; only a breaking *schema* change (new required field, changed field meaning) increments `packVersion`, and the loader would then carry a small migration for older embedded packs.
+- User override packs in `~/.config/agentdeck/packs/` win over embedded packs of the same `name`; a `packVersion` mismatch on an override is a hard error surfaced in Settings (so a stale hand-written pack fails loudly rather than silently misparsing).
+
 ## 7. UI screens
 
 `Board` — responsive card grid, needs-attention first (waiting_approval > waiting_input > working > done/exited), pull-to-refresh, state badges with live durations. `Session` — tabs: Terminal (xterm + MobileKeysBar: Esc/Tab/Ctrl/arrows/Enter), Approval sheet (bottom sheet when pending: prompt text + option buttons + "show terminal" fallback), Diff, Info (events timeline). `Settings` — push setup, quiet hours, tokens, packs list.

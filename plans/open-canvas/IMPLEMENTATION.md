@@ -57,7 +57,7 @@ Model must output edits as:
 (replacement)
 >>>>>>> REPLACE
 ```
-Rules enforced by `parse.ts`: 1+ blocks; SEARCH nonempty (except append form `SEARCH` empty + marker `@@append`); blocks applied in order; overlapping matches rejected. `apply.ts` ladder per §0; every successful apply → re-parse validation (babel for js/tsx, XML parse for svg, JSON.parse for json, no-op for md/html) — parse failure = apply failure → repair loop with real error. Providers failing bench < 60% get `capabilities.fullRewriteOnly=true` → edit turns regenerate whole file (still versioned).
+Rules enforced by `parse.ts`: 1+ blocks; SEARCH nonempty (except append form `SEARCH` empty + marker `@@append`); blocks applied in order; overlapping matches rejected. `apply.ts` ladder per §0; every successful apply → re-parse validation (babel for js/tsx, XML parse for svg, JSON.parse for json, no-op for md/html) — parse failure = apply failure → repair loop with real error. Providers failing bench below the `@TUNE(fullRewriteThreshold=0.60)` apply-success rate get `capabilities.fullRewriteOnly=true` → edit turns regenerate whole file (still versioned). The threshold is calibrated in M4 T4 against `bench/edits` recorded results; until a provider has a bench score it is treated as capable (blocks first, repair on failure).
 
 ## 4. Database schema
 
@@ -105,3 +105,46 @@ Main split: ChatPane left (messages, cost ticker per turn), right tabs [Preview 
 ## 8. Test mapping
 
 Release-blocking: sandbox-escape suite, apply-validation (zero silent corruption — every apply re-parses), version immutability. Bench harness is the F2 gate. Playwright: generate → edit → restore → export happy path.
+
+## 9. Intent routing, repair loops & prompt fixtures
+
+**Intent classification (`router.ts`)** — heuristic-first with an LLM tiebreak and a defined fallback so the failure mode is never undefined:
+
+```
+function classify(message, hasActiveArtifact):
+  m = message.toLowerCase()
+  # 1. Deterministic heuristics (fast path, no LLM)
+  if not hasActiveArtifact and matches(m, /\b(make|create|build|generate|new)\b/):
+    return NEW
+  if hasActiveArtifact and matches(m, /\b(change|edit|fix|update|add|remove|rename|refactor)\b/):
+    return EDIT
+  if matches(m, /^\s*(what|why|how|explain|does|can|is|are)\b/) or endsWith(m, "?"):
+    return ANSWER
+  # 2. Ambiguous → single cheap LLM call returning one token: NEW|EDIT|ANSWER
+  label = llmClassify(message, hasActiveArtifact)   # fixtures/prompts/route.md
+  if label in {NEW, EDIT, ANSWER}: return label
+  # 3. Fallback when LLM errors or returns garbage (never throw):
+  return hasActiveArtifact ? EDIT : NEW
+```
+
+**Repair loops (`repair.ts`, max 2 each)** — "real context" passed to the repair prompt is precisely: (a) the failed SEARCH block(s) verbatim, (b) the surrounding ±8 lines of current file content around the best fuzzy-match anchor (or whole file if <120 lines), and (c) the concrete failure reason ("SEARCH not found" | parse error message | runtime error+stack). It is never the whole conversation.
+
+**Prompt fixtures** (committed under `fixtures/prompts/`, all versioned `# v1`):
+- `generate.md` — NEW-artifact generation; vars `{{artifactType}} {{userMessage}}`; output = raw artifact body.
+- `edit.md` — EDIT turn; vars `{{artifactType}} {{currentContent}} {{userMessage}}`; output = SEARCH/REPLACE blocks per §3.
+- `edit-repair.md` — apply-failure repair; vars `{{failedBlocks}} {{contextWindow}} {{reason}}`; output = corrected SEARCH/REPLACE blocks only.
+- `runtime-fix.md` — runtime-error repair; vars `{{currentContent}} {{errorMessage}} {{stack}}`; output = SEARCH/REPLACE blocks.
+- `route.md` — classification tiebreak; vars `{{message}} {{hasActiveArtifact}}`; output = exactly one of `NEW|EDIT|ANSWER`.
+
+**Renderer contract versioning** — each version row stamps `renderer_version` (default `v1`). Wrappers live in `renderers/v1/`. A breaking wrapper change ships as `renderers/v2/` with `v1` retained verbatim; old versions keep rendering under their stamped version. There is no in-place migration — stamps are immutable, so historical artifacts never re-render differently.
+
+## 10. Error Recovery & Graceful Degradation
+
+| Failure | Trigger | Backoff | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Provider stream error | non-2xx / socket drop / timeout 120s mid-stream | 1 retry of the turn if 0 deltas received; no retry once deltas started (would duplicate) | emit `{t:'error', message}`; keep last good version unchanged | ChatPane inline error bubble + "Retry" button |
+| Edit apply fails | SEARCH not found / re-parse fails | repair loop, max 2, each with real context (§9) | after 2 fails: discard the turn, keep prior version; if provider is `fullRewriteOnly`, do a full regenerate instead | `{t:'apply_failed'}` → banner "couldn't apply edit, kept previous version" |
+| Runtime error in preview | PreviewFrame postMessage `runtime_error` | auto-fix loop, max 2 | after 2 fails: stop, show error, leave artifact as-is | ErrorFixBanner: "fixing…" → "couldn't auto-fix" with error text |
+| Router LLM error | classify tiebreak call fails | no retry | deterministic fallback (`§9`: EDIT if artifact exists else NEW) | silent; user sees the resulting action |
+| Provider unreachable at test | `providers/test` non-2xx/timeout 15s | no retry | mark provider `unverified`; block generation with clear message | Providers table shows red "failed" with error |
+| esbuild-wasm bundle failure | react artifact fails to compile | no retry | render compile error into PreviewFrame body (not blank) | Preview shows the esbuild error text |

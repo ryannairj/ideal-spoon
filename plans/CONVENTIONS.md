@@ -42,6 +42,42 @@ Every `PLAN.md` contains, in order:
 - **Docs**: every project ships `README.md` (setup in ≤ 5 commands), `ARCHITECTURE.md` (kept current), and `DECISIONS.md` (append-only log of deviations from the plan).
 - **Licensing**: MIT by default for tools intended as open source; plans flag exceptions.
 
+## Specification rigor (for AI-agent executability)
+
+These standards close the gaps that most often force an implementing agent to invent a decision. They apply to every plan.
+
+### Pseudocode for non-trivial algorithms
+
+Any algorithm that is more than a single obvious step must appear as pseudocode in `IMPLEMENTATION.md`, not only as prose. This includes clustering, similarity/scoring, decay, ranking, diffing, merging, conflict resolution, and any multi-branch heuristic. Rule of thumb: if the prose contains a name like "kmeans-lite", "trigram similarity", "decay with half-life", or "LWW tie-break", there must be 5–15 lines of pseudocode showing the actual computation, inputs, outputs, and boundary behavior.
+
+### Tuning constants marked `@TUNE`
+
+Every empirically-chosen constant (similarity thresholds, decay half-lives, Elo K-factors, overlap tolerances, cosine cutoffs, EMA α, retry counts) must be either:
+
+- **Justified** — a one-line rationale or reference next to the value, or
+- **Marked `@TUNE`** — written as `@TUNE(name=value)` in `IMPLEMENTATION.md` §0, with a note stating the milestone that calibrates it against a named fixture set. `@TUNE` means "this is a starting value, not a settled decision; the calibration task owns final tuning."
+
+Never lock an unexplained magic number as if it were settled.
+
+### Error Recovery & Graceful Degradation section
+
+Every `IMPLEMENTATION.md` that calls an external service (network, LLM, filesystem watchers, OS APIs) must contain a section titled **"Error Recovery & Graceful Degradation"** that specifies, for each failure class:
+
+- **Trigger** — the exact condition that counts as failure (timeout ms, HTTP status class, malformed/non-schema output, exception type).
+- **Backoff** — retry count, base delay, cap, and jitter (state "no retry" explicitly when that is the choice).
+- **Fallback** — the degraded result the user/system gets when retries are exhausted (cached value, deterministic substitute, skip-with-warning, queue-for-later).
+- **User-facing UX** — what the user sees (banner, toast, silent log, disabled control).
+
+"Retry gracefully" with no trigger/backoff/fallback is not acceptable.
+
+### LLM prompt templates as versioned fixtures
+
+Projects that call an LLM must commit representative prompt templates as versioned files under `fixtures/prompts/` (e.g. `fixtures/prompts/<task>.md`), referenced by path from `IMPLEMENTATION.md`. Each template pins its role/system message, the input variables (as `{{placeholders}}`), the required output schema, and one worked example. This removes prompt invention at implementation time. Prompt changes are reviewed like code and versioned (a `# v1`, `# v2` header suffices for the MVP).
+
+### Boundary conditions as acceptance criteria
+
+Boundary and edge-case behavior must be expressed as explicit, testable acceptance criteria in `PLAN.md` feature specs — not left to idiom. Examples: bucket-edge assignment ("a result whose timestamp equals a rollup boundary belongs to the newer bucket"), overlapping spans, concurrent-merge tie-breaks, empty/one-element inputs, and platform-specific limits. Each such AC must map to at least one automated test.
+
 ## Definition of done (per milestone)
 
 - All checklist items complete; acceptance criteria for the milestone's features pass via automated tests.

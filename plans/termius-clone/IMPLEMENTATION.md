@@ -155,6 +155,19 @@ Single window. Left sidebar (host tree + search), center tab strip (terminal tab
 
 **Sync merge** (merge.rs): pull server blobs since local cursor → decrypt → for each entity: if local `updated_at` > remote → keep local, queue push; if remote > local → overwrite local; if both changed since last sync (version mismatch on push, HTTP 409) → keep remote, clone local as `"<label> (conflict <device> <date>)"` new entity. Tombstones (`deleted=1`) replicate like edits; purge after 90 days.
 
+**Jump-host depth limit (why 4).** The cycle-guard cap of 4 is a safety bound, not a protocol limit: it terminates accidental cycles and pathological configs while covering every realistic topology (client → bastion → inner-bastion → target = depth 3; 4 leaves one hop of headroom). Deeper chains are almost always a misconfiguration; erroring with `JumpChainTooDeep` is safer than opening N nested connections. Configurable later via settings if a real need appears; hard-coded for MVP.
+
+**russh fallback trigger (concrete criteria).** The `ssh2`-crate fallback for the agent path is taken only if, during M2 T4, **any** of these is observed against the docker `agent` topology: (a) `russh` agent-forwarding fails to authenticate against a standard `ssh-agent`/`gpg-agent` socket after the auth ladder completes (reproducible in integration test `ac_agent_forward.rs`), or (b) forwarded-agent channel open returns unsupported/`ChannelOpenFailure` on ≥2 of the 3 test servers. "Blocking" = the agent AC cannot pass with `russh` alone. Scope of fallback: agent auth path only; password/key paths stay on `russh`. Decision + evidence logged in `DECISIONS.md`.
+
+## 7a. Sync conflict-resolution UI
+
+When `merge.rs` creates a conflict copy, the UI surfaces it non-destructively:
+
+- The cloned entity `"<label> (conflict <device> <date>)"` appears in the host tree with a **conflict badge** (amber dot) next to both it and the surviving original.
+- Clicking the badge opens a **Conflict drawer**: side-by-side field diff (local-kept vs conflict-copy), per-field "use this value" buttons, and a single **Resolve** action that writes the chosen merge into the original and soft-deletes (`deleted=1`) the conflict copy.
+- No auto-merge of field values ever happens silently — LWW decides which row *survives as canonical*, but the user always sees that a divergence occurred until they dismiss/resolve it.
+- Status bar shows a conflict count; "Resolve all later" is allowed (copies simply remain as normal hosts, fully usable).
+
 ## 8. Milestone task lists
 
 **M0** — T1 scaffold workspace exactly as §1 (`pnpm create tauri-app` then restructure); T2 CI (fmt+clippy+vitest+`tauri build` matrix); T3 local PTY tab: `portable-pty` dev-only shell wired through `session_open` path to prove channel plumbing; T4 xterm pane + fit/webgl addons. *Done when CI produces 3 artifacts and typing in the local shell works.*

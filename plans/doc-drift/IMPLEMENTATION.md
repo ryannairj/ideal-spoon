@@ -86,3 +86,44 @@ Inputs: `mode: diff|full`, `semantic: bool`, `config`. Steps: install binary (re
 ## 8. Test mapping
 
 The corpus FP gate is the covenant (PLAN §10) — runs on every PR. insta snapshots per extractor/checker. `assert_cmd` CLI-level tests for exit codes/formats. Semantic eval nightly.
+
+## 9. Algorithm details
+
+**Symbol-matching heuristic (`check/symbols.rs`) — exact, not fuzzy.** Doc code-spans are matched against the tree-sitter symbol index by *exact* identifier, never edit-distance (fuzzy matching produces false drift). The dotted-path is resolved left-to-right:
+
+```
+function resolveSpan(span):                 # span already matched CMD/symbol regex in §0
+  name = strip trailing "()" from span
+  parts = name.split(".")
+  if parts.len == 1:                         # bare "foo"
+    hits = index.byName(parts[0])            # exact identifier match across langs
+    if hits.empty: return NotAClaim          # unresolved single word → ignored (never SYM001)
+    return Resolved(hits)
+  # dotted: "Class.method" | "module.func" | "pkg.Type.Method"
+  container = index.byName(parts[0])
+  if container.empty: return NotAClaim       # unknown container → not our claim (avoid noise)
+  member = index.member(container, parts[1..])   # walk members via ts child scopes
+  return member.empty ? Missing(name) : Resolved(member)
+```
+
+A span becomes a **SYM001** only when (a) it is anchored, or (b) `parts[0]` resolves to a known container/symbol but the member is gone, or (c) the name existed at `HEAD~`/anchor and no longer exists. Unanchored bare words that never resolved are silently ignored — this is the noise-control covenant.
+
+**Snippet synthesis & import resolution (`check/snippets/*.rs`).** To typecheck a fenced snippet without executing it:
+
+```
+function synthesize(snippet, lang):
+  body = hidden_setup_lines(snippet) ++ snippet.code   # <!-- docdrift-hidden: ... -->
+  imports = collect import/use/require statements from body
+  for imp in imports:
+    if resolvable against repo (tsconfig paths / PYTHONPATH / go.mod module root):
+      keep as-is (real import → real type check)
+    else:
+      leave unresolved → the runner reports it as SNIP001 (broken doc dependency)
+  write body to a temp file under the repo root (so relative imports & tsconfig resolve)
+  run: ts → `tsc --noEmit` | py → `python -m py_compile` | go → `gofmt -e`
+  argv built without a shell; snippet code is NEVER invoked/run (design test enforces)
+```
+
+Import resolution therefore uses the *repo's own* config (tsconfig `paths`, go module root, package layout); unresolved imports are a legitimate SNIP001 rather than a crash.
+
+**Semantic cache key granularity.** The cache key is `sha256(normalize(prose_paragraph) || "\x00" || normalize(code_region))` where `normalize` = trim + collapse internal whitespace + strip trailing comments; the unit of caching is **one prose-paragraph × anchored-code-region pair** (not the whole file). Changing either side invalidates only that pair's entry. Model id is folded into the key (`model || key`) so switching `DOCDRIFT_MODEL` doesn't serve stale verdicts. Entries stored as JSON files in `.docdrift-cache/<first2>/<hash>.json`.

@@ -14,7 +14,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | Unit conversion | kitchen table in `core/units.ts`; density table top 100 ingredients (`content/densities.yaml`); rounding to kitchen fractions {⅛,¼,⅓,½,⅔,¾} |
 | Canonical dict | `content/ingredients.yaml` ~800 entries `{id, canonical, aliases[], aisle, staple: bool}`; unresolved → embedding match ≥ 0.85 else raw-line passthrough |
 | Timer detection | regex on steps: `(\d+)[-–]?(\d+)?\s*(min|minute|hour|hr)s?` → timer_sec (range → upper) |
-| Dup detection | same URL OR (title trigram ≥ 0.7 AND ingredient-set Jaccard ≥ 0.6) → merge prompt |
+| Dup detection | same URL OR (title trigram ≥ `@TUNE(dupTitle=0.7)` AND ingredient-set Jaccard ≥ `@TUNE(dupIngredients=0.6)`) → merge prompt (calibrated in M1 T3 against `fixtures/merge.yaml`; see §9) |
 | Cookable-now | staples assumed present; rank groups: missing-0, missing-1, missing-2 with gap list |
 | List merge | same canonical id: sum when units convertible (via density if cross volume/weight), else stacked sub-lines |
 | Offline | recipe box + images cached (service worker + IndexedDB mirror of user's recipes); capture queues |
@@ -92,3 +92,40 @@ Full-screen route; `navigator.wakeLock` (re-acquire on visibilitychange); step s
 ## 8. Test mapping
 
 Extraction corpus (recorded; nightly live per-site pass/fail table published to job summary — site breakage early warning). Parser/scaler/merger golden+property suites = math gate. Playwright mobile: share URL → card → cook → timer; offline box; list flow.
+
+## 9. Thresholds, merge order & Error Recovery
+
+**Duplicate-detection thresholds (`@TUNE`).** The two-signal AND gate (title trigram ≥ 0.7 **and** ingredient Jaccard ≥ 0.6) is a starting point biased toward *precision* — a false merge is more annoying than a missed duplicate (which the user can merge manually). Both constants are calibrated in M1 T3 against `fixtures/merge.yaml` (labeled `duplicate | distinct` pairs incl. hard negatives: same dish different site, and same site different servings). Target: **precision ≥ 0.95** (few wrong merge prompts), recall reported. Constants live in one place and are overridable.
+
+**Merged ingredient line order (deterministic).** When `merge.ts` combines list items, output order is fixed so results are stable and testable:
+
+```
+function orderMergedLines(items):
+  resolved = items with canonical id, grouped by partition
+  sort resolved by (aisle asc, canonical asc)          # aisle-grouped, then alphabetical within aisle
+  unresolved = raw-passthrough items (no canonical id)
+  sort unresolved by (first-seen recipe order, then raw text asc)
+  return resolved ++ unresolved                          # resolved first, unresolved stacked after
+```
+
+Within a summed partition the canonical line is emitted once; recipe refs are attached in ascending recipe-add order. Golden test in the merge suite asserts byte-stable ordering.
+
+**Timer background handling (platform matrix).** Cook-mode timers are best-effort across PWA platforms; behavior is pinned per platform rather than assumed:
+
+| Platform | Foreground | Backgrounded / screen off |
+|---|---|---|
+| Android PWA | live countdown + Web Notification at 0 | Notification fires if permission granted; else on-return banner reconciles elapsed time from stored `endsAt` |
+| iOS PWA (standalone) | live countdown | JS timers suspend; on return, elapsed computed from `endsAt` timestamp → if past, immediate "timer done" banner; no background notification (documented limitation) |
+| Desktop browser | live countdown + Notification | Notification if granted; tab throttling tolerated via `endsAt` reconciliation |
+
+Every timer persists `endsAt` (absolute epoch) to IndexedDB, so correctness never depends on the interval firing — the UI recomputes remaining time on any resume/visibilitychange.
+
+**Error Recovery & Graceful Degradation:**
+
+| Failure | Trigger | Backoff / handling | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Fetch blocked / paywall | non-2xx, timeout (10 s), or readability yields < 200 chars | 1 retry with rotated UA | ladder stops; job emits `needs_paste` state | "Couldn't read that page — paste the recipe text or a photo" |
+| LLM normalize invalid | zod validation fails on normalize/vision output | 1 re-prompt with the zod error list | mark low-confidence fields amber; keep raw readability text as `note_md` so nothing lost | card opens in review-lite with ambered fields |
+| Vision extraction fails | both retry attempts fail | — | recipe saved as title-only shell + original image attached | "Add the details — we saved your photo" |
+| Capture job crash | worker dies mid-ladder | BullMQ retry (2, backoff 5 s→30 s); snapshot already in S3 so re-run is cheap | job marked failed after retries | capture row shows "retry" button |
+| Offline capture | user offline at share time | outbox queues request in IndexedDB | flushes on reconnect | "Saved — will fetch when you're back online" |

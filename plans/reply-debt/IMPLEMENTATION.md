@@ -11,7 +11,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | Shared core | `packages/core` — scoring, drift, sync merge; imported by client + server (single source of truth) |
 | Sync | field-level LWW with `updated_at` + tombstones; batch push/pull `since` cursor; client-generated UUIDv7 ids |
 | Scoring constants | `urgency = age_days × tierWeight{inner:3, close:2, everyone:1} × boost` (boost: time_sensitive 2.0, they_asked_question flag 1.5, else 1.0); paydown list = top 5 |
-| Drift | `drift = days_since_last_interaction / cadence_days`; dashboard threshold ≥ 1.25; digest weaves in max 1 drifted person/day (highest drift, not nagged in last 7 d) |
+| Drift | formal definition in §8; dashboard threshold ≥ 1.25; digest weaves in max 1 drifted person/day (highest drift, not nagged in last 7 d) |
 | Deep links | `whatsapp://send?phone=`, `sms:`, `mailto:`, `tel:`, `instagram://user?username=` with `https://wa.me/` etc. web fallbacks; matrix in `core/deeplinks.ts` |
 | OCR | `tesseract.js` client-side lazy-loaded; text stored with debt, never uploaded unless sync on (screenshots synced to S3 encrypted at rest, per-user key envelope) |
 | Push | 1 daily digest (user hour, default 08:30) + same-day time-sensitive; hard cap 2/day enforced server-side |
@@ -58,7 +58,17 @@ outbox: '++seq'                                // unsynced row refs
 
 ## 4. Sync contract
 
-`POST /api/sync {deviceId, push: Row[], pullSince: cursor}` → `{applied: n, pull: Row[], cursor}`. Row = `{table, id, data|null (tombstone), updated_at}`. Merge (core/merge.ts): newer `updated_at` wins per row; equal → deviceId lexical; tombstone wins ties. Two-device divergence suites (edit/edit, edit/delete) in core tests — no lost debts invariant: a row acked by server is never silently dropped (pull replay test).
+`POST /api/sync {deviceId, push: Row[], pullSince: cursor}` → `{applied: n, pull: Row[], cursor}`. Row = `{table, id, data|null (tombstone), updated_at}`. Merge (core/merge.ts) is a **total, commutative order** so any device applying the same set of rows converges identically — evaluate these keys in order (first difference wins):
+
+```
+function winner(a, b):                  # a = incoming, b = existing; returns keeper
+  if a.updated_at != b.updated_at: return later(a, b)      # 1. newest wins
+  if a.deleted != b.deleted:       return the deleted one   # 2. equal ts → tombstone wins
+  if a.deviceId != b.deviceId:     return lexicographically-greater deviceId  # 3. stable tiebreak
+  return a                          # 4. identical origin → idempotent, either is fine
+```
+
+Rationale: tie-break is checked *before* deviceId only when timestamps are exactly equal, so "tombstone wins" and "deviceId lexical" never contradict — they are ordered rungs, not competing rules. Two-device divergence suites (edit/edit, edit/delete, delete/edit) in core tests assert commutativity (apply order A-then-B == B-then-A) and the no-lost-debts invariant: a row acked by server is never silently dropped (pull replay test).
 
 ## 5. Key flows
 
@@ -78,3 +88,18 @@ outbox: '++seq'                                // unsynced row refs
 ## 7. Test mapping
 
 core: golden scoring/drift + fast-check (age monotonicity, tier ordering). Sync divergence suites. Playwright mobile: share→capture→offline→sync→digest link→paid. Push cap release-blocking. Capture friction budget test: share-to-saved ≤ 3 interactions (scripted).
+
+## 8. Drift algorithm (`core/drift.ts`)
+
+Drift measures how overdue a relationship is relative to its intended contact rhythm. Pure function over a person + their interactions (no I/O), golden-tested.
+
+```
+function driftFor(person, now):
+  cadence = person.cadenceDays ?? defaultCadence[person.tier]   # inner 7, close 21, everyone 60 (days)
+  last    = maxInteractionDate(person) ?? person.createdAt      # any kind: replied/met/called/note
+  if person.archived or person.tier == 'everyone' and no cadenceDays: return null  # opted out
+  daysSince = floor((now - last) / 1 day)
+  return daysSince / cadence                                    # 1.0 = exactly due, >1 = overdue
+```
+
+@TUNE(defaultCadence={inner:7, close:21, everyone:60}), @TUNE(driftThreshold=1.25). Dashboard lists people with `drift ≥ 1.25`, sorted desc. Digest weaving: pick the single highest-drift person **not** surfaced in a digest in the last 7 days (tracked via `interactions` of kind `note`/last-nudged marker in `meta`); ties broken by longer `daysSince`. `null` drift (opted-out / no cadence for `everyone`) never appears on dashboard or in digests. Fake-clock tests assert: overdue detection at the boundary, exclusion of nagged-in-7d, and that logging any interaction resets drift below threshold next tick.

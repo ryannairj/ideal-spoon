@@ -8,7 +8,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 |---|---|
 | Name | **Plately** · proprietary; self-host compose shipped |
 | Stack | Next.js 15 PWA + TS 5; Postgres 16 + pgvector (Drizzle); Redis + BullMQ; S3-compatible (MinIO in compose); Auth.js magic link |
-| Vision model | `claude-haiku-4-5` for estimation; embeddings: image via `nomic-embed-vision` API-compat NOT used — decision: text-side embedding of `{caption from estimation + note}` with `text-embedding-3-small` + perceptual hash (`sharp` dHash) for repertoire pre-filter; cosine τ = 0.86 AND dHash distance ≤ 10 → candidate match |
+| Vision model | `claude-haiku-4-5` for estimation; embeddings: image via `nomic-embed-vision` API-compat NOT used — decision: text-side embedding of `{caption from estimation + note}` with `text-embedding-3-small` + perceptual hash (`sharp` dHash) for repertoire pre-filter; cosine `@TUNE(τ=0.86)` AND dHash distance ≤ `@TUNE(dHashMax=10)` → candidate match. Both calibrated in M2 against the repertoire precision/recall fixture sets (same-meal-different-lighting must match; lookalike-different-meal must not) |
 | Estimation output (zod, fixed) | `{items:[{name, portion_desc, grams_est, kcal_lo, kcal_hi, protein_g, carbs_g, fat_g, confidence}], meal_confidence, caption}` |
 | Display rule | always show `kcal_lo–kcal_hi`; rollups use midpoint; per-user calibration multiplier applied to both bounds |
 | Slots | inferred: <10:30 breakfast, <15:00 lunch, <21:00 dinner, else snack (user tz; editable) |
@@ -87,12 +87,14 @@ job(mealId): photo → dHash + prelim: embed(note) if note else skip-to-vision
     AND (mealId,repId) ∉ denied_pairs AND times_logged ≥ 2
   if best candidate → apply base_items ⊕ adjustments → source='repertoire', confidence=candidate score
     → UsualBanner state (client shows "the usual? ✓/✗")
-  else → vision call (photo + note) → zod validate (retry 1) → items + caption
-    → meal_confidence < 0.45 → flag needs_question (client shows ConfidenceQ S/M/L → scale grams ×{0.7,1,1.4} locally)
+  else → vision call (photo + note, prompt `fixtures/prompts/estimate.md`) → zod validate (retry 1 with error) → items + caption
+    → meal_confidence < `@TUNE(0.45)` → flag needs_question (client shows ConfidenceQ S/M/L → scale grams ×{0.7,1,1.4} locally)
+    → both attempts fail zod/timeout → status='failed': meal saved as empty manual-entry shell so nothing is lost; client opens ItemChipEditor with a "couldn't read this photo — add items" banner
   calibration: kcal_lo/hi ×= users.calibration
   embed caption → on user confirm (2nd identical log), upsert repertoire row
-weekly.ts: correction bias = Σ(user-corrected kcal midpoint / estimated) capped [0.85,1.15]
-  → users.calibration (EMA α=0.3); surfaced in report ("we've adjusted by −8%")
+weekly.ts: correction bias = Σ(user-corrected kcal midpoint / estimated) capped `@TUNE([0.85,1.15])`
+  — the cap bounds a single week's calibration drift to ±15% so one mislabeled meal can't swing targets wildly
+  → users.calibration (EMA `@TUNE(α=0.3)`); surfaced in report ("we've adjusted by −8%")
 retention: photos deleted after N days if user sets photo_retention (default keep)
 ```
 
@@ -111,3 +113,20 @@ Today (DayRing kcal range fill, ProteinBar, meal list by slot, streak badge, log
 ## 8. Test mapping
 
 Benchmark harness = F2 gate (CI recorded, nightly live w/ cost). Repertoire precision/recall on fixture sets (same meal diff lighting vs lookalike different meals). Fake-clock suites (slots/streaks/reports). ED-adjacency review: copy audit checklist committed (`docs/tone-checklist.md`), hide-numbers E2E.
+
+## 9. Prompt fixtures & Error Recovery
+
+**Prompt fixtures** (`fixtures/prompts/`, mirrored under `fixtures/llm/` for recorded responses, versioned `# v1`):
+- `estimate.md` — full estimation; vars `{{imageAttachment}} {{note}}`; output = the Estimation zod schema (§0); worked example included.
+- `correct-text.md` — free-text correction delta; vars `{{currentItems}} {{userText}}`; output = revised `items[]` only (never re-reads the photo).
+
+**Error Recovery & Graceful Degradation**
+
+| Failure | Trigger | Backoff | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Vision estimation | non-JSON / zod-invalid / timeout 30s | 1 retry with validation error appended | `status='failed'`, save empty manual shell; nothing lost | Meal detail banner "couldn't read photo — add items" |
+| Vision provider down | 5xx/network, both attempts | BullMQ 3× base 10s ×3 then dead-letter | same manual-shell fallback | as above |
+| Free-text correction | LLM fail/invalid | 1 retry | keep prior items unchanged | toast "couldn't apply, try again" |
+| Embedding | 5xx/timeout | 2 retries base 2s ×2 | meal saved without repertoire embedding (no "usual?" matching); backfilled nightly | silent |
+| Barcode (OpenFoodFacts) | 404 / 5xx / timeout 8s | no retry on 404; 1 retry on 5xx | fall back to manual grams+macros entry | "product not found — enter manually" |
+| Upload | S3/network fail | outbox exp backoff base 5s cap 5min | stays queued, nothing lost | offline badge shows pending count |

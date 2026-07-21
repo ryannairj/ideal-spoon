@@ -13,7 +13,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | DB | SQLite `~/.loam/loam.db` (stdlib `sqlite3`); audit JSONL `~/.loam/audit/YYYY-MM-DD.jsonl` |
 | Config | `~/.loam/config.toml` (provider, persona, surfaces) + `~/.loam/grants.toml` (capabilities), both hot-reloaded (mtime check per turn) |
 | Loop limits | max 8 tool iterations/turn; per-tool timeout 30 s; context: persona + grants summary + top-5 memories + last 20 turns |
-| Embeddings | `fastembed` (local, default) or provider; memory retrieval hybrid: cosine + SQLite FTS5, RRF |
+| Embeddings | `fastembed` (local, default) or provider; memory retrieval hybrid: cosine + SQLite FTS5, RRF; eval corpus committed at `tests/fixtures/memory_eval/` (30 memories + 15 queries + expected top-3, gate ≥ 85%) |
 | Scheduler | APScheduler 4, SQLite jobstore; missed-fire grace 12 h |
 | Surfaces | CLI (typer + rich), Telegram (`python-telegram-bot` 21), web (FastAPI + Jinja, read-mostly, `127.0.0.1:8990`) |
 | Tools (MVP 6) | `memory`, `schedule`, `web_fetch`, `rss`, `weather` (open-meteo, no key), `shell` |
@@ -96,6 +96,10 @@ handle(msg: InboundMsg) -> reply:
 Every llm.chat and tool run emits audit rows (invariant enforced by wrapper — there is no unaudited path).
 ```
 Shell tool: argv-only execution (`subprocess.run(list, shell=False)`), binary must match a `shell:<binary>` grant, args validated against metacharacter denylist even though shell=False (defense in depth), cwd `~`, output cap 8 KiB.
+
+**Shell metacharacter denylist (codified, not deferred).** `shell.py` rejects any arg containing these before execution (release-blocking injection suite covers each): `; & | ` ` $ ( ) < > \n \r { } [ ] * ? ~ ! # \\` and the substrings `$(`, `${`, `&&`, `||`, `>>`. It also rejects args that are absolute paths outside `~` or contain `..` path traversal, and refuses if `argv[0]` (post-grant) resolves via `PATH` to a binary outside the standard dirs. The list lives as a single constant `SHELL_DENY` with a comment linking to `tests/injection/shell_injection_test.py`.
+
+**Time parsing confirm-echo format.** When `dateparser` resolves a reminder/schedule time, the loop echoes back a fixed template before committing: `→ <weekday> <D Mon YYYY> at <HH:MM> <tz> (in <relative>). Correct? [y/N]`, e.g. `→ Fri 24 Jul 2026 at 09:00 AEST (in 2 days). Correct? [y/N]`. Rendered in the active surface (CLI text / Telegram inline y-n). No confirmation within 60 s → abort (nothing scheduled). Ambiguous parse (dateparser returns None or multiple) → ask for a rephrase, never guess.
 
 ## 6. Surfaces & commands
 

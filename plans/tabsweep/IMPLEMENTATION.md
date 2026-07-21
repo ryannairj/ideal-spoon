@@ -13,7 +13,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | Tab identity | `windowId:tabId` while live; on restart reconcile by (url, windowIndex, tabIndex) heuristic; unresolved → treat as new (age preserved via url-hash match if unique) |
 | Defaults | TTL 14 d; sweep style: confirm-batch daily until user enables silent (suggested after 14 d clean); shelf expiry 60 d + 7 d grace; aging cue OFF |
 | Protected (never auto-swept) | pinned, audible, active-in-any-window, whitelisted domain/window, form-activity flag |
-| Form activity heuristic | tab has `status=complete` and title changed after user input? Not detectable without content scripts — decision: use `chrome.tabs.Tab.autoDiscardable === false` OR url matches `/checkout|compose|edit|draft|form/` pattern list; imperfect, biased to protect |
+| Form activity heuristic | tab has `status=complete` and title changed after user input? Not detectable without content scripts — decision: use `chrome.tabs.Tab.autoDiscardable === false` OR url matches `/checkout|compose|edit|draft|form/` pattern list; imperfect, biased to protect (see §8 for quantified target) |
 | Intent categories | `read, buy, reference, reply, watch, unknown`; heuristics: domain packs `content/domains.json` + url/title regex pack `content/patterns.json` (versioned, in-repo) |
 | Topic clusters | local: normalized title token TF-IDF + greedy centroid clustering (no embeddings dependency); cluster label = top 2 tokens |
 | LLM (optional) | BYO key (openai_compat incl. Ollama URL); batch: `[{url, title}] → [{intent, topic}]` 50/req; results cached by url-hash; NEVER page content |
@@ -84,6 +84,24 @@ corrections: 'domain'                        // {domain, intent}  — user overr
 **M3** — T1 digest build + highlights (incl. re-opened-after-sweep tracking via urlHash match on onCreated) + weekly alarm + badge nudge; T2 llm.ts optional pass (+Ollama URL support, urls+titles-only assertion test, cache) → ≥90% on fixtures with LLM; T3 onetab import (1k fixture, import-day dating note) + JSON/HTML export + import-back lossless test.
 **M4** — T1 firefox build (WXT target; API diffs behind `browser.` polyfill audit) + parity e2e subset; T2 store listing assets + screenshots script + privacy manifest ("no data leaves your machine unless you add an LLM key — and then only titles/urls"); T3 MV3 permission audit test (manifest declares exactly the §0 set); T4 alarm/fake-time suite polish. Tag v1.0 + store submissions.
 
-## 7. Test mapping
+## 7. Error Recovery & Graceful Degradation
 
-Playwright-with-extension: ledger restart, sweep/undo/restore, amnesty, MV3 worker-kill chaos, digest triage. Vitest: rules table, lifecycle machine, categorize metrics vs `tabs-labeled.json`, io round-trips. "Never delete silently" invariant: grep-level test that no `tabs.remove` call site lacks a preceding shelf write or explicit user action context.
+| Failure | Trigger | Backoff / handling | Fallback | User-facing UX |
+|---|---|---|---|---|
+| LLM batch call fails | non-2xx or timeout (10 s) from BYO endpoint | 2 retries, base 1 s, ×2, cap 8 s + jitter; whole batch of 50 retried once then split into 2×25 on 413/token errors | rows keep heuristic `intent/topic` (never blocked on LLM); `llm_cache` unwritten so next alarm retries | silent; Options shows "last LLM pass: N categorized, M skipped (offline)"; no toast spam |
+| Service worker killed mid-sweep | MV3 terminates worker between shelf-write and `tabs.remove` | on next wake, reconcile finds shelf row without closed tab → dedupe by `urlHash` (max one duplicate shelf row) | tab stays open + shelf row exists (safe: never lost) | none; duplicate collapses on next hourly reconcile |
+| Restore scroll unsupported | `chrome.sessions` absent (Firefox private, some builds) or `sessions.restore` throws | catch → plain `chrome.tabs.create({url})` | tab reopens at top (scroll lost) | one-time info in Options: "scroll restore unavailable in this browser" |
+| Ledger flush fails | Dexie/IndexedDB quota or transaction error | keep in-memory buffer, retry on next 30 s tick; if quota → surface | live `tabs.query` remains authoritative source | badge warning + Options banner "storage full — export shelf" |
+| Corrupt import file | OneTab/JSON parse error | abort import, no partial writes | existing shelf untouched | error with line/row hint; "nothing was imported" |
+
+## 8. Quantified heuristics & test mechanisms
+
+**Form-activity heuristic (biased-to-protect).** The heuristic is intentionally asymmetric: it may over-protect (false positive = a stale tab survives a sweep) but must never under-protect a genuine in-progress form. Acceptance target on `fixtures/tabs-labeled.json` (500 rows, `formActive` ground-truth column): **recall ≥ 0.95** on true form tabs (missing ≤5% is release-blocking); **precision unconstrained** (false positives acceptable — they only delay a sweep, never lose data). CI metric asserts recall on the labeled set; precision reported for information only.
+
+**LLM token-cost estimate.** Payload per item is `{url, title}` only (§0). Budget assumption: url+title ≈ 40 input tokens/tab; batch of 50 ≈ 2k input + ~600 output (`[{intent,topic}]`) ≈ 2.6k tokens/batch. A heavy user with 2k uncategorized tabs = 40 batches ≈ 104k tokens ≈ **< $0.05 one-time** at commodity rates; results cached by `urlHash` so steady-state cost is only new tabs. Documented in PRIVACY.md so users understand BYO-key spend.
+
+**Fake-time testing for MV3 alarms.** `@webext-core/fake-browser` stubs `chrome.alarms`; tests drive time by (a) calling the exported alarm handlers directly with a synthetic `alarm` object, and (b) advancing a injected `now()` clock (all decay/expiry logic reads `deps.now()`, never `Date.now()` directly — enforced by a lint rule). Suite covers: TTL boundary (`now - lastActive` exactly = TTL → not yet stale; `> TTL` → stale), grace-window edge (shelf `expireAt` boundary), and weekly digest firing at the configured day/hour across a DST transition.
+
+## 9. Test mapping
+
+Playwright-with-extension: ledger restart, sweep/undo/restore, amnesty, MV3 worker-kill chaos, digest triage. Vitest: rules table, lifecycle machine, categorize metrics vs `tabs-labeled.json` (recall gate per §8), io round-trips, fake-time alarm boundaries. "Never delete silently" invariant: grep-level test that no `tabs.remove` call site lacks a preceding shelf write or explicit user action context.

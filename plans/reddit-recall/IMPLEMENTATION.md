@@ -15,7 +15,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | Digest schema (zod) | `{tldr, consensus, top_answers:[{claim, support, caveats, permalink}], dissent:[…], action_items:[…]} ` — every top_answer/dissent must carry a permalink present in pruned set (validator) |
 | Nudge policy | 3 d → 10 d → 30 d → auto-archive w/ digest mention; ≤1 push + ≤1 email per day per user |
 | Email | Resend, weekly digest Sunday per-user-tz 8:00 |
-| Collections | auto-suggest at cosine ≥ 0.78 to centroid; centroids recomputed nightly |
+| Collections | auto-suggest at cosine ≥ `@TUNE(autoCollectThreshold=0.78)` to centroid; centroids recomputed nightly + incrementally on accept (see §10) |
 | Est read time | words/200 wpm on digest (not thread) |
 | Ports | web 3000, worker 3004 |
 
@@ -85,7 +85,7 @@ Pages are server components reading Drizzle. Mutating routes: `POST /api/ingest 
 
 ## 6. Pipelines (worker jobs)
 
-**backfill.ts**: paginate `/user/{name}/saved` (100/page) via cursor in sync_state; resumable; enqueue fetch per item; rate-limited by shared bucket. **poller.ts**: newest-first until seen `newest_fullname`. **fetchThread.ts**: `GET {permalink}.json?limit=500&depth=3` → store post + raw comments → prune.ts (deterministic per §0, store pruned + `flat_comments` text) → deleted/removed detection (`[removed]` body or 404 → status `gone` if nothing cached). **distill.ts**: cluster top-level comment trees into ≤ 6 clusters (embed + kmeans-lite) → map summaries → reduce digest (zod + permalink validator, 1 retry) → embed(title+tldr) → collection suggestion. **queueEngine/nudge.ts**: schedule per policy on `distilled`; cancel on read_state change; caps + quiet hours. **weekly.ts**: compose per §PLAN F5 (skip if zero activity); track opens via pixel.
+**backfill.ts**: paginate `/user/{name}/saved` (100/page) via cursor in sync_state; resumable; enqueue fetch per item; rate-limited by shared bucket. **poller.ts**: newest-first until seen `newest_fullname`. **fetchThread.ts**: `GET {permalink}.json?limit=500&depth=3` → store post + raw comments → prune.ts (deterministic per §0, store pruned + `flat_comments` text) → deleted/removed detection (`[removed]` body or 404 → status `gone` if nothing cached). **distill.ts**: cluster top-level comment trees into ≤ 6 clusters (embed + kmeans-lite, pseudocoded in §10) → map summaries (prompt `fixtures/prompts/map.md`) → reduce digest (prompt `fixtures/prompts/reduce.md`, zod + permalink validator, 1 retry) → embed(title+tldr) → collection suggestion. **queueEngine/nudge.ts**: schedule per policy on `distilled`; cancel on read_state change; caps + quiet hours. **weekly.ts**: compose per §PLAN F5 (skip if zero activity); track opens via pixel.
 
 ## 7. Screens
 
@@ -102,3 +102,43 @@ Inbox (new+distilled, ItemCard: title, subreddit, TL;DR 2 lines, ReadTimeChip, c
 ## 9. Test mapping
 
 Recorded Reddit JSON fixtures drive fetch/prune/distill suites; nightly live eval on 3 public threads (drift watch). Rate-limit simulation (429 handling + backoff) release-blocking. Fake-clock nudge/digest suites. Playwright: connect(mock) → ingest → distilled → digest view → done.
+
+## 10. Algorithms, prompt fixtures & eval rubric
+
+**kmeans-lite (`distill.ts`)** — clusters the pruned top-level comment embeddings; deterministic given a fixed seed so recorded-fixture tests are stable:
+
+```
+function clusterComments(embeds):        # embeds = unit-normalized vectors, n = len
+  if n <= 3: return [allInOneCluster]     # too few to cluster
+  k = min(6, max(2, ceil(sqrt(n / 2))))   # cap 6 per §0; grows slowly with n
+  centroids = kmeansPlusPlus(embeds, k, seed=1337)   # k-means++ seeding (not random)
+  repeat up to 15 iterations:
+    assign each point to nearest centroid by cosine distance
+    recompute each centroid = mean of its points, re-normalize
+    if max centroid shift < 1e-4: break   # convergence
+  drop clusters with < 2 points (fold their points into nearest kept cluster)
+  return clusters sorted by summed member score desc
+```
+
+`k` is chosen by the closed form above (no elbow search — keeps it cheap and deterministic); `@TUNE(kCap=6, minClusterSize=2)` calibrated against `fixtures/threads/` in M2.
+
+**Centroid freshness (`collections.ts` / `centroids.ts`)** — to avoid stale nightly-only suggestions: on every `accept-suggestion` or manual add, incrementally update the centroid as a running mean (`c' = (c*m + v)/(m+1)`, re-normalized); the nightly job does the authoritative full recompute (mean of all members) to correct drift. A newly-distilled item is matched against **current** centroids immediately, so suggestions are never more than one accept stale.
+
+**Auto-collect threshold** — `0.78` is a starting value (`@TUNE`); M3 T3 records precision/recall of suggestions against the fixture corpus and adjusts. Below threshold → no suggestion (never auto-assign silently).
+
+**Prompt fixtures** (`fixtures/prompts/`, versioned `# v1`):
+- `map.md` — per-cluster summary; vars `{{clusterComments}}`; output = `{summary, keyClaims:[{claim, permalink}]}`.
+- `reduce.md` — digest synthesis; vars `{{postTitle}} {{clusterSummaries}}`; output = the Digest schema (§0); example shows every `top_answer`/`dissent` carrying a permalink drawn from input.
+
+**Eval rubric (`fixtures/eval/rubric.md`)** — committed schema, 5 criteria scored 0/1 each (pass = ≥ 4/5): (1) TL;DR factually matches thread, (2) consensus reflects highest-scored answers, (3) every claim's permalink resolves to a real pruned comment, (4) dissent captured when present, (5) no fabricated info. Stored as YAML front-matter + prose per criterion so the eval harness can parse scores.
+
+## 11. Error Recovery & Graceful Degradation
+
+| Failure | Trigger | Backoff | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Reddit API rate limit | HTTP 429 / bucket exhausted | honor `X-Ratelimit-Reset` / `Retry-After`; else base 2s ×2 cap 60s; shared Redis bucket pauses all users' jobs | requeue item, no data loss; backfill resumes from cursor | Connect card shows "syncing… (rate-limited, will resume)" |
+| Reddit token expired | 401 | 1 refresh attempt via refresh-token | if refresh fails: mark account `needs reconnect`, pause polling | Settings shows "Reconnect Reddit" |
+| Thread deleted/removed | `[removed]`/`[deleted]` body or 404 | no retry | `status='gone'`; keep cached digest if one exists, else show "no longer available" | Item card badge "removed on Reddit" |
+| LLM distill (map/reduce) | non-JSON / zod-invalid / permalink validator fail / timeout 60s | 1 retry with error appended | `status='failed'`, item stays in inbox as raw pruned thread (readable, no digest) | Item shows "summary unavailable — view thread" |
+| Embedding | 5xx/timeout | 2 retries base 2s ×2 | item saved without embedding; FTS-only search + no auto-collection; nightly backfill re-embeds | silent |
+| Email/push send | Resend/web-push non-2xx | 3 retries base 5s ×2; web-push 410 → delete sub | drop notification (respect daily cap), log; digest still viewable in-app | none |

@@ -98,7 +98,7 @@ on PR opened/synchronize (dedupe on X-GitHub-Delivery, skip if head already revi
    callers/callees (same-repo grep+symbol match, max 5 each), fileImports, prDescription}
  4 lenses (parallel, p-limit 3): prompt(lens, bundles chunked ≤ 12k tokens) → Finding[] (zod)
  5 verify: strong model per finding with FULL bundle → {verdict: confirm|reject|downgrade,
-   confidence 0..1, rationale}; keep confirm ∧ confidence ≥ 0.7
+   confidence 0..1, rationale}; keep confirm ∧ confidence ≥ `@TUNE(verifyConfidence=0.7)` (calibrated in M2 T5 against `bench/`)
  6 dedupe by fingerprint; drop muted_patterns matches (state suppressed_muted)
  7 rank: severity desc, confidence desc; apply min_severity + max_comments cap
  8 publish single GitHub review: summary body (TL;DR + walkthrough table) + inline comments
@@ -127,3 +127,55 @@ Repos list (enabled toggle, config status) · Repo detail: reviews table (status
 ## 8. Test mapping
 
 `bench/` is the regression gate (PR-time recorded, nightly live with metrics in job summary). diffmap + publish idempotency (duplicate delivery → one review) are release-blocking suites. Dry-run guard test: replay pipeline with network-mocked octokit asserting zero write calls.
+
+## 9. Diff-position mapping, labels schema & prompt fixtures
+
+**diffmap.ts (release-blocking)** — maps a finding's `(path, line)` in the head file to a GitHub review `position` (the 1-based index within that file's unified diff hunks). GitHub only accepts comments on lines present in the diff:
+
+```
+function toReviewPosition(patch, targetLine):   # patch = the file's unified-diff text
+  position = 0                                  # counts every hunk line after each @@ header
+  newLine  = null
+  for raw in patch.lines:
+    if raw.startsWith("@@"):
+      newLine = parseHunkHeaderNewStart(raw)    # "@@ -a,b +c,d @@" → c
+      position += 1                             # the @@ line itself counts as a position
+      continue
+    position += 1
+    if raw.startsWith("-"):  continue           # deletion: no new-file line, don't advance newLine
+    if raw.startsWith("+") or raw.startsWith(" "):
+      if newLine == targetLine:  return position
+      newLine += 1
+  return null    # target line not in diff → finding attached to file-level or dropped (see §10)
+```
+
+Edge cases covered by the exhaustive suite: renamed files (map against new path), deleted files (no positions → skip), multi-hunk files, first/last line of a hunk, additions vs context vs deletions, CRLF. A finding whose line maps to `null` becomes a file-level comment rather than being silently dropped.
+
+**Benchmark labels schema (`bench/labels/*.yaml`)** — formalized:
+
+```yaml
+pr: 42
+clean: false            # true = PR should produce zero findings (false-positive test)
+findings:
+  - path: src/auth.ts
+    line: 88
+    kind: security       # one of the 5 lenses
+    must_find: true      # binary: counts toward recall
+    weight: 1.0          # optional, default 1.0; lets critical bugs dominate the score
+```
+
+Scoring (`score.ts`): recall = Σweight(matched must_find) / Σweight(all must_find); precision = confirmed-findings-matching-a-label / all-confirmed-findings; a `clean:true` PR producing any finding fails the FP gate. A finding matches a label when same `path` and `line` within ±3 and same `kind`.
+
+**Prompt fixtures** — the templates in `packages/llm/src/prompts/` are the committed, versioned fixtures (`lens_*.ts`, `verify.ts`, `walkthrough.ts`, `thread.ts`), each pinning role, input variables (`{{contextBundle}}`, `{{finding}}`, repo `{{instructions}}`), and the zod output schema from `packages/pipeline/types.ts`. Recorded-LLM fixtures for tests live alongside via `packages/llm/testing.ts`.
+
+## 10. Error Recovery & Graceful Degradation
+
+| Failure | Trigger | Backoff | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Lens LLM call | non-JSON / zod-invalid / timeout 60s | 1 retry with parse error appended | drop that lens's findings for the chunk, continue other lenses; log | review still posts with remaining lenses; summary notes "N lenses degraded" |
+| Verify LLM call | 5xx / timeout / non-JSON | 1 retry | on failure, treat finding as `downgrade` (not auto-confirm) — conservative, avoids noise | finding suppressed rather than posted unverified |
+| Provider fully down | all retries exhausted across lenses | queue-level: BullMQ retry 2×, base 30s ×2 | mark review `failed`; post neutral "review unavailable, will retry on next push" | PR gets one honest status comment, not silence |
+| Clone/checkout | git error / network / timeout 120s | 1 retry | mark `failed`, cleanup workspace | status comment; no partial review |
+| GitHub API publish | 5xx / secondary-rate-limit | honor `Retry-After`; else 3 retries base 2s ×2 | persist findings with `github_comment_id=null`; retry publish on next delivery (idempotent by fingerprint) | comment appears on retry; no duplicates |
+| Token budget exceeded | cumulative tokens ≥ `TOKEN_BUDGET_PER_REVIEW` | n/a | stop after current lens, publish what's verified so far, mark review `published` (partial) | summary notes "budget reached: N of M files analyzed" |
+| Diff too large | diff lines > `MAX_DIFF_LINES` | n/a | skip review | comment "diff too large (X lines) — skipped" |

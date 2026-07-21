@@ -15,7 +15,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | Graders (fixed kinds) | `exact`, `regex`, `contains`, `json_schema`, `js` (node:vm, 5 s timeout, no require/fs/net), `llm_rubric` (1–5 + reason; optional `self_consistency: 3` majority), `human` (UI grading queue) |
 | Score model | each grader → `{score: 0..1, pass: bool, reason?}`; cell score = weighted mean (suite weights, default equal); case pass = all required graders pass |
 | Run artifact | `runs/<iso>-<slug>/manifest.json` + `cells/<case>-<variant>.json` `{request, response, streamRaw?, scores[], usage, cost, latencyMs, promptHash}` |
-| Elo | K=32, initial 1000, ties = 0.5; stored per suite in `suites/<name>.elo.json` |
+| Elo | K=32, initial 1000, ties = 0.5; stored per suite in `suites/<name>.elo.json`. K=32 chosen as the chess-standard provisional value — fast convergence over the small (tens, not thousands) comparison counts a local A/B produces; @TUNE(eloK=32) revisit only if ratings oscillate on >200-vote suites |
 | Concurrency | per-provider `rate: {concurrent: 4, rpm?: n}` in arena.yaml; retries 3 × expo backoff on 429/5xx |
 | Baseline | `suites/<name>.yaml` field `baseline: <runId>`; "promote" writes it |
 | CI reporters | `--reporter junit|markdown|json`; `--assert` reads suite `thresholds: {min_mean, max_regressions, min_pass_rate}` |
@@ -77,6 +77,26 @@ baseline: 2026-07-12T…-a1b2
 ## 5. Key behaviors
 
 **Regression view:** join baseline+current cells on case id: improved (fail→pass or +0.1 score), regressed (reverse), new-fail; aggregate deltas; fixture-pair unit test. **Blind A/B:** server strips provider/model fields from cell payloads until vote posted (DOM snapshot test asserts no leak, incl. response headers/usage block); min 10 comparisons before Elo table shows confidence note removal. **Cost:** provider-reported usage preferred; missing → tiktoken estimate flagged `estimated: true`; pricing changes never retro-apply (cost stored at run time).
+
+**JS grader sandbox (`jsGrader.ts`):** grader source runs in a `node:vm` context, never the host realm. Isolation contract:
+
+```
+ctx = vm.createContext({                 // frozen, minimal globals only
+  input, output, expected, vars,         // the cell data, deep-cloned (no host refs)
+  console: { log: capture },             // buffered, surfaced in reason on fail
+  JSON, Math, Date, RegExp               // pure builtins; NO require/process/globalThis
+})                                       // Object.freeze(ctx) before run
+script = new vm.Script(`(async()=>{ ${src} })()`)
+result = await Promise.race([
+  script.runInContext(ctx, { timeout: 5000 }),   // vm hard timeout (sync CPU)
+  wallClockTimeout(5000)                          // covers await/microtask stalls
+])
+// enforced: no require, no fs, no net, no process — none are in scope, so a
+// reference throws ReferenceError (caught → grader error, cell marked ungraded).
+// grader must return {score:0..1, pass:bool, reason?}; malformed return = error.
+```
+
+The context is created fresh per cell (no state bleed between cases). Because `require`/`process`/`globalThis`/`import` are simply absent from the context, there is no host bridge to escape through; the timeout guards both busy-loops (`vm` `timeout` option) and awaited stalls (outer wall-clock race). Escape-attempt suite (fs read, net fetch, `process.exit`, `while(true)`, prototype-pollution of a returned object) is release-blocking.
 
 ## 6. Milestone task lists
 

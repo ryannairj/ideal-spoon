@@ -14,7 +14,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | Date resolution | LLM outputs `due_raw` string ONLY; `chrono-node` resolves against `said_at` + user tz; ambiguous/failed → `due_at=null` + `needs_when=true` (UI "when?" chip); NEVER LLM-resolved dates |
 | Item types | `task, event, note, shopping, reminder, tell` (fixed) |
 | Auto-file guardrails | never auto-file: unresolved dates, `tell`/`reminder` types, confidence < rule τ (default 0.9); auto-filed → daily digest note |
-| Destinations | `internal` (default), `ics` (events; per-user private feed `/api/ics/<token>.ics`), `webhook` (HMAC-SHA256 header `X-Mumble-Signature`, 5 retries expo backoff, dead → settings banner) |
+| Destinations | `internal` (default), `ics` (events; per-user private feed `/api/ics/<token>.ics`), `webhook` (HMAC-SHA256 header `X-Mumble-Signature`, 5 retries expo backoff base 2 s ×2 cap 60 s + jitter, dead → settings banner) |
 | Telegram | voice/audio/text accepted; replies with per-item summary + inline "open inbox" button; chat linked via one-time code from settings |
 | Retention | audio default 30 d (`keep transcript forever` on); "delete audio on confirm" mode; sweeper hourly |
 | Ports | web 3000, worker 3010 |
@@ -56,15 +56,32 @@ PLAN §7 with: `captures.transcript jsonb {words:[{w,s,e}], text}`; `items.span 
 ```
 capture uploaded (or telegram file fetched) → transcribe.ts (STT iface) → captures.transcript
 → extractJob: prompt(transcript.text + word count) → items[] zod (retry 1 w/ errors)
-  span sanity: 0 ≤ start < end ≤ wordCount; overlaps > 10% between items → keep higher-confidence, flag other
+  span sanity: 0 ≤ start < end ≤ wordCount; overlaps > `@TUNE(spanOverlap=10%)` between items → resolveOverlap (below)
   → dates.ts per item: chrono(due_raw, {instant: said_at, timezone: user.tz}) →
      unambiguous single result → due_at; else needs_when
 → rules.ts: matching enabled rule ∧ guardrails pass → auto_file (route + digest note)
    else state=draft → inbox; push "3 items from your voice note" (respect quiet hours)
 → telegram origin: bot reply with summary lines + inbox button
 confirm (single or all-per-capture) → route.ts: internal insert | ics upsert | webhook POST
-merge hint: new item title trigram ≥ 0.55 vs open items same type within 7 d → MergeHint chip
+merge hint: new item title trigram ≥ `@TUNE(mergeTrigram=0.55)` vs open items same type
+            within `@TUNE(mergeWindowDays=7)` → MergeHint chip
 ```
+
+**Span overlap resolution (`resolveOverlap`).** Overlap fraction = `intersectionWords / min(lenA, lenB)`. The 10% tolerance absorbs off-by-one word-boundary noise from the model without merging genuinely distinct items; it is `@TUNE` and calibrated in M1 against `labels.yaml`.
+
+```
+function resolveOverlap(a, b):                 # called only when overlap > spanOverlap
+  keep, drop = (a, b) if a.confidence >= b.confidence else (b, a)
+  drop.flag = "overlaps_kept_item"             # kept in inbox, visually flagged, not auto-filed
+  # tie (equal confidence): keep the longer span; if still tied, keep earlier startWord
+  return keep, drop
+```
+
+The dropped item is never silently deleted — it stays as a flagged draft the user can confirm.
+
+**Merge-hint thresholds (`@TUNE`).** trigram ≥ 0.55 and a 7-day window are deliberately *loose* — a merge hint is a non-blocking suggestion (chip), so recall matters more than precision. Both are calibrated in M4 T3 against confirmed-item pairs; a wrong hint costs one dismiss tap.
+
+**Multi-day ICS `dtend`.** For an event with a resolved date but no end time: all-day event → `DTEND = DTSTART + 1 day` (RFC5545 exclusive end). If chrono resolves a start *and* end (range phrase like "Mon to Wed") → `DTEND = end date + 1 day` for all-day, or exact end instant for timed. Timed event with no duration → default 60 min. Validated by the `node-ical` fixture test.
 
 ## 5. API contract (key routes)
 
@@ -85,3 +102,14 @@ Record (default page): giant RecordButton, live waveform (wavesurfer), elapsed, 
 ## 8. Test mapping
 
 Ramble corpus = F2 permanent gate (recorded STT+LLM fixtures in CI; nightly live drift report). Dates golden = cardinal-sin gate. Guardrails table + webhook HMAC + retention release-blocking. Playwright mobile: record → inbox → confirm → ICS/webhook fixture receipt; telegram flow via harness.
+
+## 9. Error Recovery & Graceful Degradation
+
+| Failure | Trigger | Backoff / handling | Fallback | User-facing UX |
+|---|---|---|---|---|
+| STT fails | provider non-2xx or timeout | 2 retries, base 3 s ×2 cap 30 s | capture kept as audio-only with `transcript=null`; re-transcribe button | capture card shows "couldn't transcribe — tap to retry"; audio still playable |
+| Extraction invalid | zod fails on items[] | 1 re-prompt with error list | capture saved with transcript + zero items; user can add manually | "transcribed, but couldn't pull out items — here's the text" |
+| Ambiguous/failed date | chrono returns 0 or >1 result | — (never LLM-guess a date) | `due_at=null` + `needs_when=true` | WhenChip "when?" on the item |
+| Webhook delivery fails | non-2xx/timeout on destination | 5 retries, base 2 s ×2 cap 60 s + jitter | after final retry, destination marked `dead`; item stays confirmed internally | settings banner "webhook failing — last error …"; re-enable retries |
+| Telegram send fails | bot API error | grammY built-in retry; then drop reply | item still ingested and in inbox | none (inbound already succeeded) |
+| Offline capture | recorder finishes while offline | outbox queues chunks in IndexedDB, resumable upload | flush on reconnect | "queued" badge on record screen |

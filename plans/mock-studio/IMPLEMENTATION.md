@@ -90,3 +90,29 @@ mockstudio freeze [--out scenarios/recorded.yaml]   # from a --record session's 
 ## 8. Test mapping
 
 Never-crash-on-weird-spec: corpus grows via bug reports; loader failures must produce actionable errors (assert_golden on messages). Statistical + determinism + lifecycle suites release-blocking. Playwright drives pin-as-override and scenario toggle flows.
+
+## 9. Store inference, validation default & load strategy
+
+**Store inference (`store/infer.go`)** — formalized RESTful heuristic over the resolved route table; ambiguous cases are surfaced, never guessed silently:
+
+```
+function inferStores(routes):
+  stores = {}
+  # collection = GET/POST on /segment ; item = GET/PUT/PATCH/DELETE on /segment/{id}
+  for each route:
+    (base, idParam) = splitTrailingIdParam(route.path)   # "/pets/{petId}" -> ("/pets", petId)
+    name = lastPathSegment(base)                          # "pets"
+    if route has {id} tail and method in {GET,PUT,PATCH,DELETE}: stores[name].item += route
+    if route ends at base and method in {GET,POST}:          stores[name].collection += route
+  for name, s in stores:
+    if s has both a collection and an item shape: mark s CONFIRMED, key = the id param name
+    else: mark s AMBIGUOUS (partial CRUD) — do NOT auto-create; list in /routes + startup log
+  # nested scoping: /users/{userId}/posts -> store "posts" keyed by (userId, postId)
+  return CONFIRMED stores; AMBIGUOUS ones fall back to generated examples until user maps them
+```
+
+User override (`x-mockstudio-store` or UI) always wins over inference.
+
+**Response-validation default (restating §0/§3 explicitly):** the default is **pass-through** — a response that violates its spec schema is still served to the client, with a `WARN` ring-log entry and a red badge in `/__studio`. Only `--fail-on-validation-error` changes this to a hard error (startup static check exits 1; runtime violations return `500 {error:'validation'}`). Mock Studio never silently drops or mutates a violating response.
+
+**Load strategy:** the spec is fully parsed and the resolved route table built **eagerly at startup** (so the 300-endpoint < 2 s cold-start bench and 404 route hints work); fake-data generation and store tables are **lazy per-request** (first hit to a route synthesizes and caches its generator). `--watch` rebuilds the route table on change, preserving stores where schema-compatible.

@@ -64,7 +64,9 @@ CREATE TABLE pr_comments (repo text, pr int, comment_id bigint, head_sha text, P
 
 **evidence.bundle(pkg, from, to)**: registry versions in `(from, to]` → per source in §0 order collect raw texts scoped to that range (release-tag matching by semver; changelog section slicing by version headers) → distill per version-chunk (≤ 8k tokens/chunk) → merge + zod validate (invalid breaking-without-evidence → downgrade to `review`-class `feature` with note) → inject api-diff breakings → cache.
 
-**apidiff.extract(pkg@v)**: `pacote extract` → locate types entry (`types`/`exports.types`/bundled `.d.ts`; `@types/<pkg>` fallback) → ts-morph project → exported surface map `{name → {kind, sigHash}}`. `diff`: removed (breaking), changed sigHash (breaking-candidate), added (info). No types → `{unavailable: true}`.
+**apidiff.extract(pkg@v)**: `pacote extract` → locate types entry (`types`/`exports.types`/bundled `.d.ts`; `@types/<pkg>` fallback) → ts-morph project → exported surface map `{name → {kind, sigHash}}`. `diff`: removed (breaking), changed sigHash (breaking-candidate), added (info). No types → `{unavailable: true}`. sigHash normalization and overload merging are pseudocoded in §9.
+
+**distill(pkg, from, to, rawTexts)**: chunk raw evidence ≤ 8k tokens → call LLM with the committed template `fixtures/prompts/distill.md` (see §9) → parse JSON → zod-validate against the Changes schema (§0). The citation rule (`breaking` requires `evidence_url`) is enforced post-parse, not left to the model.
 
 **usage.scan(repoDir, pkg)**: workspace-aware (respect `pnpm-workspace.yaml`/`workspaces` globs; attribute per package); find import sites → member usage: named imports tracked to identifiers used; namespace imports → `ns.member` property accesses; default import → all-usages-of-binding; dynamic import w/o static members → `unknown`. Output sites `[{file, line, snippet, symbols[], confidence}]`.
 
@@ -85,3 +87,64 @@ CREATE TABLE pr_comments (repo text, pr int, comment_id bigint, head_sha text, P
 ## 8. Test mapping
 
 `bench/` = asymmetric quality gate (wrong-safe = build fail). Surface-extraction and lockfile parsers get fuzz/fixture suites. Recorded-LLM fixtures throughout; nightly live with cost report.
+
+Benchmark expected outputs are committed, not just referenced: each entry in `bench/bumps.yaml` links to a fixture directory `bench/repos/<case>/` plus an `expected.json` (the exact verdict + affected-site list). The harness (`bench/run.ts`) diffs actual vs `expected.json` and fails on any regression. Example `bumps.yaml` entry:
+
+```yaml
+- case: zod3-to-4
+  pkg: zod
+  from: 3.23.8
+  to: 4.0.0
+  repo: repos/zod3-users/      # fixture tarball dir
+  expected: repos/zod3-users/expected.json
+```
+
+## 9. Algorithms (pseudocode) & prompt fixtures
+
+**sigHash normalization + overload merging** — a symbol with N call/construct signatures (overloads) collapses to one stable hash so that reordering overloads is not a false "changed":
+
+```
+function sigHash(symbol):
+  sigs = []
+  for each overload in symbol.callSignatures ∪ symbol.constructSignatures:
+    t = ts-morph type text of overload           # e.g. "(a: string, b?: number): Foo"
+    t = stripComments(t)
+    t = collapseWhitespace(t)                     # runs of space/newline → single space
+    t = normalizeParamNames(t)                    # a,b,... → positional $0,$1 (names are not API)
+    t = expandOneLevelAlias(t)                    # resolve type aliases one level; stop (no deep recursion)
+    sigs.push(t)
+  sigs = sort(sigs)                               # order-independent: overload reordering is not a change
+  body = symbol.kind + "|" + sigs.join("§")
+  return sha256(body).slice(0, 16)
+```
+
+Removal of any overload changes the joined body → changed sigHash → breaking-candidate. Adding an overload also changes the hash but is classified `added`/info by comparing signature-set membership (removed-overload set non-empty ⇒ breaking).
+
+**lockfile diff parsing** — one function per manager (`npm.ts`/`pnpm.ts`/`yarnBerry.ts`), all returning `{pkg, from, to}[]`:
+
+```
+function diffLockfile(baseText, headText, manager):
+  base = manager.parse(baseText)   # → Map<pkgKey, version>; pkgKey = name (+ path for workspaces)
+  head = manager.parse(headText)
+  changes = []
+  for key in head.keys():
+    if key not in base: continue           # newly added dep → not a "bump", skip (no from-version)
+    if base[key] != head[key]:
+      changes.push({ pkg: nameOf(key), from: base[key], to: head[key] })
+  # removals (key in base, not head) are ignored: nothing to review for a removed dep
+  return dedupeByPkgKeepingWidestRange(changes)
+```
+
+Manager-specific `parse`: npm reads `packages` map keyed by `node_modules/...` paths (v2/v3 lockfileVersion); pnpm reads `packages:` keys `/name@version`; yarn-berry reads YAML resolution entries. Malformed or unknown `lockfileVersion` → `parse` throws `LockParseError` (handled in §10).
+
+**Prompt fixture** — `fixtures/prompts/distill.md` (v1) pins: system role ("changelog distiller, cite or omit"), input variables `{{pkg}} {{from}} {{to}} {{rawChunk}}`, required output = JSON array of the Changes schema, and one worked example showing a `breaking` entry with a real `evidence_url` and a `feature` entry without one.
+
+## 10. Error Recovery & Graceful Degradation
+
+| Failure | Trigger | Backoff | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Registry/evidence fetch (npm, GitHub) | HTTP 5xx / network error / timeout 10s | 3 retries, base 500ms, ×2, cap 5s, full jitter; 429 honors `Retry-After` | Drop that evidence source, continue with remaining sources at downgraded confidence; if all sources fail, verdict caps at `review` | CLI: yellow "evidence degraded" note in report; server sticky comment adds "⚠ partial evidence" line |
+| LLM distill | timeout 60s / non-JSON / zod-invalid | 1 retry with the parse error appended to the prompt | Fall back to api-diff + raw-changelog-only mode (as `--no-llm`); mark chunk `distill_failed` | Report footer: "summaries unavailable for N versions (raw links shown)" |
+| `.d.ts` extraction | `pacote` extract fails / no types entry | no retry | `{unavailable:true}` → api-diff contributes nothing; rely on changelog evidence only | Report notes "API surface unavailable" |
+| Lockfile parse | `LockParseError` / unknown lockfileVersion | no retry | Skip that lockfile, process others; if the PR's only lockfile is unparseable, post neutral comment | Comment: "could not parse <file> (lockfileVersion X)" |
+| Token budget hit (audit) | cumulative tokens ≥ `budget_tokens` | n/a | Stop distilling, emit partial ranked table with remaining deps marked `not-analyzed`, resumable next run | "budget reached: N of M analyzed" |

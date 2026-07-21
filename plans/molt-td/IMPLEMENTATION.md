@@ -12,7 +12,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | PRNG | `seedrandom` (alea), all randomness through injected `Rng` |
 | Damage types | `kinetic, fire, frost, shock, toxin` (+ `true`) |
 | Resist cap | 70% soft (Normal caps 50%), trait floors per PLAN |
-| Adaptation constants (initial tuning) | `adapt_rate=0.10` (Normal 0.07, Hard 0.13), `decay=0.03`, molt every 3rd wave locks top resist as trait with floor 30% |
+| Adaptation constants (initial tuning) | @TUNE(adapt_rate=0.10) (Normal 0.07, Hard 0.13), @TUNE(decay=0.03), molt every 3rd wave locks top resist as trait with @TUNE(traitFloor=0.30); all calibrated by balance harness (§6) |
 | Grid | square cells 64 px; maps 20×12; path via baked flow field per map (generated at build from map JSON) |
 | Save format | JSON in localStorage keys `molt.meta`, `molt.run` (run = seed + input log) |
 | Replay/share code | `base64url(deflate(JSON{seed, mapId, inputLog}))` |
@@ -101,3 +101,17 @@ MainMenu → RunSetup (3 seeded map offers, loadout pick) → GameScene+HudScene
 ## 8. Test mapping
 
 CI per-PR: determinism hash, content validation, counter-matrix, unit suites (damage order, evolution math, economy, effects DSL), playwright smoke (place → survive wave 1). Nightly: balance report. Replay tick-perfection test: recorded 15-wave input log → final hash equality.
+
+## 9. Visual/audio feedback spec (M5 T1 — clarity is a mechanic)
+
+Because reading adaptations is core play (PLAN F6), feedback thresholds are fixed, not vibes:
+
+| Cue | Trigger | Visual | Audio |
+|---|---|---|---|
+| Hit tint | every projectile hit | 80 ms flash on enemy sprite, colored by the tower's damage type (palette in `render/vfx.ts`) | per-type impact tick |
+| **Resist "ding"** | `resistApplied ≥ @TUNE(resistDingThreshold=0.30)` on a hit (i.e. ≥ 30% of that hit's damage absorbed by R) | small shield-glyph puff over the enemy in the resisted type's color + damage number drawn struck-through/greyed | distinct dull "clink" (howler), rate-limited to 1/enemy/250 ms so swarms don't cacophony |
+| Molt beat | wave where a trait locks in | 1.5 s slow-mo (sim unaffected — render-time-scale only) + carapace shader tint sweep across swarm | rising "molt" sting |
+| Pending-molt telegraph | one wave before a molt (`pendingMolt` set) | ThreatPanel banner + pulsing arrow on the trending type bar | soft warning tone once on wave start |
+| Colorblind mode | settings toggle | each damage type also carries a distinct icon shape shown everywhere color conveys meaning (bars, tints, ding glyph, TowerPanel) | — |
+
+Acceptance (PLAN F6 AC): in the 5-person playtest quiz, a resisting hit is correctly identified ≥ 90% of the time; the quiz protocol doc (M5 T5) shows 10 recorded clips (5 resisted, 5 clean) and scores identification. `resistApplied` is emitted in the sim snapshot per hit event so the render layer never recomputes resist math.

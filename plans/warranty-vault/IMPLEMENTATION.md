@@ -13,7 +13,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | Knowledge pack | `packs/{au.yaml, us.yaml, eu.yaml, uk.yaml}` in-repo, versioned; entries: merchants `{name, aliases[], return_days, holiday_extension?, url}` + category defaults `{category → warranty_months}` + statutory notes per region |
 | Warranty source precedence | user override > merchant policy > category default; provenance stored + displayed |
 | Deadlines | return_deadline = purchased_at + return_days (merchant/user); reminders return: T−3d, T−1d; warranty: T−30d, T−7d; tz = household tz |
-| Email-in | per-household `v-<nanoid10>@in.<domain>`; allowlist = member emails + confirmed extras; non-allowlisted → quarantine (visible list, 14 d retention) |
+| Email-in | per-household `v-<nanoid10>@in.<domain>`; allowlist = member emails + confirmed extras; non-allowlisted → quarantine (visible list, 14 d retention per row — see §9) |
 | Multi-item split | every extracted item ≥ $10 (setting `min_split_cents=1000`) becomes its own product; below → grouped into one "receipt items" product |
 | Dossier PDF | server-side via `@react-pdf/renderer` |
 | Freemium | 30 active products free; Stripe subscription unlocks unlimited (flag `BILLING=off` for self-host) |
@@ -83,3 +83,38 @@ Home: "Closing soon" rail (CountdownCard: product, days-left badge color-coded, 
 ## 8. Test mapping
 
 Receipt corpus = extraction gate. Reminder lifecycle fake-clock suite = release gate (a reminder firing for a returned product is the cardinal bug). Pack CI: schema + every merchant has region+return_days+url. Playwright: capture → confirm → time-travel (test clock endpoint, dev-only) → reminder → mark returned.
+
+## 9. Normalization, dossier format & Error Recovery
+
+**Merchant-name normalization (`knowledge.ts`).** Before fuzzy matching against pack aliases, both the extracted merchant and every alias pass through the same normalizer so matching is stable:
+
+```
+function normMerchant(s):
+  s = lowercase(s)
+  s = strip diacritics (NFKD → drop combining marks)
+  s = remove legal suffixes: {pty ltd, ltd, inc, llc, gmbh, co, corp, plc}
+  s = remove punctuation, collapse whitespace
+  s = drop leading "the "
+  return s
+# match: exact on normalized → else trigram ≥ 0.85 on normalized → else unmatched (category default only)
+```
+
+AC: "JB Hi-Fi Pty Ltd", "jb hi fi", and "JB HiFi" all resolve to the same pack entry.
+
+**Receipt embedding in PDF dossier (`dossier.tsx`).** The dossier embeds the receipt as an **image page**, not raw bytes: PDFs and photos are first rasterized to PNG (max 1600 px long edge) and placed on a full page via `@react-pdf/renderer` `<Image>`; original file is also attached as a linked appendix reference (filename + S3 key note). Multi-page source → one dossier page per source page. This guarantees the dossier renders identically regardless of source MIME. AC: dossier test renders for both a `.jpg` and a multi-page `.pdf` receipt.
+
+**Quarantine timeout scope.** Retention is **per quarantine row** (per inbound email), not per household: each row's `expires_at = received_at + 14 d`; the retention job hard-deletes individual expired rows + their blobs. Approving a row moves it out of quarantine (its timer no longer applies). AC: two emails received a day apart expire a day apart.
+
+**Multi-item split stickiness on price edit.** During confirm, each item has an explicit `split: keep|group` toggle. Once the user toggles an item, that choice is **sticky** and the `min_split_cents` heuristic no longer overrides it — even if a later price edit crosses the $10 threshold. Items the user never touched continue to follow the live threshold. Persisted as `item.splitOverride: bool`. AC: user groups a $12 item, then edits its price to $40 → it stays grouped.
+
+**Reminder cancellation cascade (duplicate products).** When two products are merged or one is deleted, `remindEngine` cancels the losing product's reminders atomically in the same transaction as the status change (no orphan reminders). Duplicate-product case: if the same receipt is confirmed twice (idempotency miss), the second confirm detects an existing product with identical `(household, merchant, purchased_at, total_cents)` and reuses it rather than creating duplicate reminders. AC (new test): re-confirming a receipt does not double reminders; deleting a product leaves zero due reminders for it.
+
+**Error Recovery & Graceful Degradation:**
+
+| Failure | Trigger | Backoff / handling | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Vision extraction invalid | zod fails on model output | 1 re-prompt with error list | `tesseract.js` populates `raw_text` → manual-entry confirm form | "couldn't auto-read — fill in the details (we saved your receipt)"; capture never fails |
+| Inbound email parse fails | mailparser error or no usable body/attachment | — | store as quarantine row with raw `.eml` blob | quarantine row flagged "couldn't parse — open manually" |
+| Reminder send fails | push + email both error | retry 3× base 5 s ×2 cap 60 s | reminder stays `due`, re-attempted next tick; not marked sent | home rail still shows the countdown (never silently lost) |
+| Pack load/validate fails | malformed `packs/*.yaml` at boot | CI blocks; at runtime skip bad pack, load others | category defaults only for that region | admin log warns; provenance shows "category default" |
+| Stripe webhook out of order | events arrive late/duplicated | idempotent by event id; reconcile from subscription status | entitlement recomputed from current sub state | none |

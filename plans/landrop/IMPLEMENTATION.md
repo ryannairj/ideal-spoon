@@ -13,7 +13,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | P2P | WebRTC DataChannel, vanilla `RTCPeerConnection` (no lib) wrapped in `ui/src/lib/rtc.ts`; STUN: none (LAN — host candidates only); P2P setup timeout 5 s → relay |
 | Relay | sender `POST /api/relay/{transferId}/chunks/{n}` → receiver streams `GET /api/relay/{transferId}/stream` (chunked response); constant-memory pipe via bounded channel (8 chunks buffered); backpressure = 429 + retry-after |
 | Identity | device token localStorage `ld_device` (nanoid 21), server assigns auto-name from wordlists `adjective-fruit` ("Brave Mango") |
-| Rooms | per server-interface subnet: room key = interface network; `--single-room` flag collapses |
+| Rooms | per server-interface subnet: room key = interface network (segmentation algorithm in §8); `--single-room` flag collapses |
 | Shelf | default 7 d expiry, 5 GiB quota, oldest-unpinned eviction; blob dir `$DATA/shelf/` |
 | Guest policy | `open` (default) \| `pin` (room PIN) \| `guests-limited` (send-only to non-guests, own-shelf-items-only) |
 | Save strategy | File System Access API when available (directory batch), else per-file download; >10 files without FSA → server-zipped batch download |
@@ -68,7 +68,7 @@ CREATE TABLE settings (key TEXT PK, value TEXT);
 
 **Relay HTTP:** `PUT /api/relay/{tid}/chunks/{n}` (raw bytes, idempotent per n) · `GET /api/relay/{tid}/bitmap` (resume) · `GET /api/relay/{tid}/stream` (ordered chunk stream as they arrive) · `POST /api/transfers/{tid}/complete {blake3}` → server verifies relay-path hash (has all chunks) or trusts P2P receiver's verify report. **Shelf:** `POST /api/shelf` (multipart or `{text}`), `GET /api/shelf` (room+policy filtered), `GET /api/shelf/{id}/download`, `POST /api/shelf/{id}/pin`, `DELETE`. **Join:** `GET /join/{pin?}` QR target → sets cookie for pin rooms; wrong pin → generic 404 page.
 
-**P2P dataflow (`rtc.ts`):** offerer = sender; single reliable ordered DataChannel; frames: 16-byte header `{chunkIndex u64, len u32}` + bytes; receiver acks every 16 chunks (flow control window 32); after last chunk → receiver computes blake3 (wasm, streaming) → `complete`. Wi-Fi-drop resume: reconnect WS → `GET bitmap` (relay) or ack-state re-sync (P2P) → continue from first missing chunk (torture-tested).
+**P2P dataflow (`rtc.ts`):** offerer = sender; single reliable ordered DataChannel; frames: 16-byte header `{chunkIndex u64, len u32}` + bytes; receiver acks every 16 chunks (flow control window 32); after last chunk → receiver computes blake3 (wasm, streaming) → `complete`. **Frame endianness: big-endian (network byte order)** for both header fields, pinned regardless of platform — sender writes BE, receiver reads BE (interop test asserts a fixed byte layout). Wi-Fi-drop resume: reconnect WS → `GET bitmap` (relay) or ack-state re-sync (P2P) → continue from first missing chunk (torture-tested).
 
 ## 5. Screens/UX contracts
 
@@ -85,3 +85,39 @@ Home: device grid (DeviceTile: emoji, name, platform icon), tap → SendSheet (f
 ## 7. Test mapping
 
 Torture suite (chunk loss injection via test hook, disconnects, concurrent senders, 0-byte, 4 GiB, unicode/reserved names) on both paths — release gate. Playwright 3-context E2E incl. forced-relay context. RSS/leak soak under sustained relay. Manual device matrix doc (iOS Safari, Android Chrome) per release.
+
+## 8. Room segmentation, guest enforcement & secure-context UX
+
+**Multi-subnet room segmentation (`hub/presence.go`).** The host may listen on several interfaces (Ethernet + Wi-Fi + Docker bridge). A client is placed in a room keyed by the *server-side network it connected through*, so two clients on the same LAN see each other but a Docker-bridge client doesn't leak into the Wi-Fi room:
+
+```
+function roomKeyFor(conn):
+  localIP = conn.LocalAddr().IP            # which server interface accepted this connection
+  for iface in host.interfaces:
+    for net in iface.networks (CIDR):
+      if net.contains(localIP): return net.String()   # e.g. "192.168.1.0/24"
+  return "default"                          # loopback / unknown → shared default room
+# --single-room overrides: every connection → roomKey "single"
+```
+
+Loopback (`127.0.0.0/8`) and link-local are folded into `default`. Rooms are ephemeral (no persistence); a device row stores its current `room` for shelf filtering. AC: netns sim proves cross-subnet isolation and same-subnet visibility.
+
+**Guest policy enforcement (`httpapi/guest.go`) — `guests-limited` filtering.** A guest is any device with `is_guest=1` (joined via a PIN room cookie or flagged by policy). Enforcement is a single predicate applied on every shelf/transfer read and write:
+
+```
+function canSee(device, item):        # shelf listing filter
+  if policy == 'open':          return true
+  if policy == 'pin':           return device.room == item.room    # cookie already gated join
+  if policy == 'guests-limited':
+     if not device.is_guest:    return true                        # full members see all
+     return item.device_id == device.id                            # guests: own items only
+
+function canSend(device, toDevice):
+  if policy != 'guests-limited': return true
+  return device.is_guest ? true : true      # sending TO guests always allowed
+  # guests may send (send-only); receiving is restricted by canSee on the shelf/offer
+```
+
+Offers to a guest that would require them to *read* a non-owned item are rejected server-side (not just hidden in UI) — tested in the guests-limited suite.
+
+**Secure-context fallback UX (WebRTC).** P2P is attempted only when `isSecureContext` is true (HTTPS or `--tls self`). On plain HTTP the UI never shows a broken "direct" attempt: the path chip renders **"via host"** from the start and a subtle info tooltip explains "Direct transfer needs HTTPS — run `landrop --tls self` for peer-to-peer." No error, no retry loop; relay is the silent, guaranteed floor. When secure context is available but P2P setup times out (5 s), the chip flips from "direct…" to "via host" once, with a one-line toast "couldn't connect directly, using host relay."

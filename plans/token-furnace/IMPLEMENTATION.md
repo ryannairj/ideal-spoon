@@ -110,3 +110,49 @@ account: tokens×window-price → runs + budget_ledger
 ## 9. Test mapping
 
 Golden outputs per job on fixture repos (recorded LLM); nightly live quality run publishing metrics. Release-blocking: PR-scope guard, budget/resume E2E, verifier efficacy, window math.
+
+## 10. Contracts, thresholds & Error Recovery
+
+**Job module interface (exact TS contract).** `prompts` is an object of pure builder **functions** (not static strings), so jobs can template per-unit input; `verify` returns a structured verdict, not free text.
+
+```ts
+interface Verdict { verdict: 'pass' | 'reject'; reasons: RejectReason[] }
+interface RejectReason { code: string; detail: string; unitKeyRef?: string }  // code from a job-fixed enum
+interface JobModule {
+  plan(repoCtx: RepoCtx, config: JobConfig): Unit[];          // deterministic, no LLM
+  prompts: {
+    generate(unit: Unit, config: JobConfig): ChatMessages;    // builds the generate prompt
+    verify(unit: Unit, generated: string): ChatMessages;      // builds the critic prompt
+  };
+  assemble(units: DoneUnit[]): Delivery;
+}
+```
+
+**Regenerate "reason" format.** The verifier must return machine-usable reasons: each `RejectReason.code` is drawn from a per-job fixed enum (e.g. docstrings: `PARAM_MISMATCH | INVENTED_BEHAVIOR | STYLE_DRIFT`), `detail` is one human sentence. On reject, the single regenerate prompt is `prompts.generate(unit)` **plus** a rendered block `Fix these issues:\n- <code>: <detail>` built from `reasons`. Reasons are persisted to `units.verify_verdict` (JSON) so the dashboard shows why a unit failed. Verifiers never emit prose-only rejections.
+
+**Spot-check threshold & pause-then-notify flow.** Spot-check runs the strong model at `SPOT_CHECK_RATE` (default 0.1) on already-verified units; a spot `reject` marks that unit `rejected` (not shipped) and increments a run counter. If `spotRejects / spotChecked > @TUNE(spotRejectRate=0.20)` within a run **and** `spotChecked >= 5` (min sample to avoid tripping on 1/1), the runner: (a) checkpoints and sets run `partial`, (b) sets the job `enabled=0` (paused), (c) writes a `report` row "quality gate tripped: N% spot-reject", (d) surfaces a dashboard banner + kill-switch-style alert. Resume is manual after review. AC: seeded-bad spot fixtures trip the pause at the boundary, and a 1-of-2 reject does not.
+
+**Secret-redaction regex set (`redact.ts`, applied pre-send, count logged).** Ordered patterns, each match → `«redacted»`:
+
+| Name | Pattern (RE, `g`) |
+|---|---|
+| AWS access key | `AKIA[0-9A-Z]{16}` |
+| AWS secret | `(?i)aws_secret_access_key\s*[=:]\s*[A-Za-z0-9/+]{40}` |
+| OpenAI-style key | `sk-[A-Za-z0-9]{20,}` |
+| PEM block | `-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----` |
+| JWT-shaped | `eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}` |
+| Generic password assign | `(?i)(password|passwd|pwd|token|secret)\s*[=:]\s*\S{6,}` |
+| Bearer header | `(?i)authorization:\s*bearer\s+\S+` |
+
+The redaction count per run is stored on `runs` and shown in the UI; a unit whose *entire* payload would be redacted is skipped with `error='fully-redacted'` (never shipped blank). Patterns live in one module and are unit-tested against a seeded-secret fixture.
+
+**Error Recovery & Graceful Degradation:**
+
+| Failure | Trigger | Backoff / handling | Fallback | User-facing UX |
+|---|---|---|---|---|
+| LLM call fails | non-2xx / timeout / rate-limit | 3 retries, base 2 s ×2 cap 30 s + jitter; 429 honors `Retry-After` | unit stays `pending`; run resumes from checkpoint next tick | run detail shows "retrying"; no partial PR shipped |
+| Verify keeps rejecting | 1 regenerate still `reject` | — | unit `failed`, excluded from assembly (never ships) | unit row shows reject reasons |
+| Budget exhausted mid-run | projected unit cost > remaining | checkpoint | run `partial`, resumes in next discount/budget window | "paused — budget; resumes <window>" |
+| Repo clone/pull fails | git error | 2 retries | run `failed`; previous clone retained | repo row shows last error + retry |
+| GitHub PR push fails | 4xx/5xx from API | 3 retries expo | run `partial`, delivery deferred; branch kept | "delivery pending — will retry" |
+| Provider key/decrypt error | bad `ENCRYPTION_KEY` or revoked key | fail fast | job skipped, not retried in loop | provider `/test` surfaces the error |

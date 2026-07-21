@@ -13,9 +13,9 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | Sync server | Go 1.23 single binary `repwell-sync`, SQLite, port 8720; stores E2E-encrypted oplog batches (libsodium sealed box, key from passphrase argon2id) |
 | Sync model | per-device oplog (row-level LWW by `updated_at`, device tiebreak); client merges; server is dumb encrypted mailbox |
 | Units | store kg + reps canonically; lb display via setting; increments per exercise (default barbell 2.5 kg / dumbbell 2.0 / machine 5.0) |
-| e1RM | Epley: `w × (1 + reps/30)`, reps ≤ 12 only (above → excluded from e1RM trend) |
+| e1RM | Epley: `w × (1 + reps/30)`, reps ≤ 12 only (above → excluded from e1RM trend) — Epley error grows sharply past ~12 reps, so high-rep sets would distort the strength trend; they're still logged, just not fed to e1RM |
 | Progression rules (fixed ids) | `double`, `linear`, `percent`, `manual` — pure functions in `domain/progression/` |
-| Deload | trigger: rule-specific fail-streak (3) OR e1RM slope ≤ 0 over 6 sessions (min 14 days in program); deload template −40% volume for 1 week |
+| Deload | two distinct mechanisms: (1) **per-exercise weight deload** — rule-specific fail-streak of 3 (see §4 for what "fail" means per rule) drops that exercise's working weight −10% and resets the streak; (2) **program deload week** — e1RM slope ≤ 0 over the last 6 sessions (min 14 days in program) suggests a −40%-volume week across the program. (1) is automatic per exercise; (2) is a suggested banner the user accepts/dismisses |
 | Seeded content | `content/exercises.json` (~250), `content/programs/*.json` (SL5x5, PPL, 531-ish "5/3/1 base", GZCLP, full-body-3day) |
 | Charts | uPlot · Rest timer | Notification API + vibration; iOS limits documented in-app |
 | Ports | dev 5173, sync 8720 |
@@ -82,6 +82,10 @@ percent: targets = trainingMax × table[week]; AMRAP last set: reps ≥ table.am
          ≥ target → TM +increment, < target−2 → TM −increment.
 ```
 Golden tables in `fixtures/histories/` (≥ 40 cases incl. missed session ⇒ no double-increment, manual override sets state, kg/lb switch leaves canonical kg untouched).
+
+"Fail" and "consecutive" are per **session**, not per set: a session counts as a fail for an exercise when any working set falls below `repsMin` (double) or the prescribed reps (linear). `consecutive_fails` (schema §3) increments once per failed session and resets to 0 on any successful session or on a deload. The −10% weight deload applies **only to that exercise's working weight**, not the whole program.
+
+**Stall detector (`stall.ts`).** e1RM slope is the slope `b` of an ordinary least-squares fit `e1RM = a + b·t` over the last 6 sessions' best-set e1RM (t = session index 0..5); stall = `b ≤ 0` AND ≥ 14 days elapsed in the program. Not a moving average — regression is used so a single outlier session doesn't flip the verdict. Constants (`fail-streak=3`, `−10%`, `−40%`, `6 sessions`, `14 days`) are `@TUNE` and locked by the golden tables in `fixtures/histories/`.
 
 ## 5. Sync protocol
 

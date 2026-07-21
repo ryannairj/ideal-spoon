@@ -117,9 +117,42 @@ Each stage: idempotent, writes checkpoint to `analyses.stage_state`, re-runnable
 
 ## 7. Q&A retrieval
 
-Hybrid: top 12 by cosine + top 12 by FTS rank → RRF merge → top 8 → prompt with instruction to cite paths + refuse if insufficient. Confidence gate: if best RRF score < threshold (tuned on eval set), answer template "Not found in this repo's index."
+Hybrid: top 12 by cosine + top 12 by FTS rank → RRF merge → top 8 → prompt with instruction to cite paths + refuse if insufficient. Confidence gate: if best RRF score < `@TUNE(qaConfidence)` (calibrated on `fixtures/eval/qa.yaml` in M4 T2), answer template "Not found in this repo's index."
 
-## 8. Milestone task lists
+## 8. Module clustering, logging formats & Error Recovery
+
+**Mermaid module clustering (when module count > 14).** The diagram node cap is 14 (§0). When s5 produces more modules than that:
+
+```
+function clusterForDiagram(modules):        # modules already scored by ranked-file coverage
+  if len(modules) <= 14: return modules
+  keep  = topN(modules, 13, by=coverageScore)        # 13 real nodes
+  other = modules not in keep
+  otherNode = { name: "other (" + len(other) + " modules)",
+                path_prefixes: union(other.path_prefixes),
+                members: other.map(id) }             # clickable → lists folded modules
+  edges = importEdges among keep, plus any keep↔other edge collapsed onto otherNode
+  return keep + [otherNode]                           # exactly 14 nodes
+```
+
+The `other` node is clickable in `MermaidView` and expands to the list of folded modules; folded modules still get their own module pages.
+
+**Framework-detection logging (`frameworks/registry`).** Each `detect()` result is logged as one structured JSON line: `{stage:'s2', event:'framework_detect', framework, matched:bool, evidence:[paths that triggered the match], confidence:0..1}`. Non-matches at confidence 0 are logged at DEBUG; matches at INFO. This makes "why did it think this was Django?" answerable from logs.
+
+**Citation-validator logging (`citations.ts`).** On a dropped claim it logs `{stage:'s5', event:'citation_dropped', path, startLine, endLine, reason:'no_such_path'|'out_of_range'|'still_invalid_after_reprompt', claimExcerpt}`; a per-analysis counter `citationsDropped` is written to `analyses.stage_state` and surfaced as a coverage note ("N claims dropped for unverifiable citations").
+
+**Error Recovery & Graceful Degradation**
+
+| Failure | Trigger | Backoff | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Clone | git error / repo >`MAX_REPO_MB` / timeout | 1 retry (transient net) | mark repo `failed` with reason; size cap → sampled mode instead of fail | ProgressCard shows error or "sampled (coverage X%)" banner |
+| Bulk summary LLM (s4) | non-JSON / zod-invalid / timeout | 1 retry with parse error | skip that file's summary (keep symbols + signature), continue | file viewer shows "summary unavailable"; overview unaffected |
+| Synthesis LLM (s5) | 5xx / timeout | 2 retries base 5s ×2 | fall back to deterministic module map (dir-based clusters, no narrative) so overview still renders | banner "narrative unavailable — showing structural map" |
+| Citation invalid | path/range check fails | 1 re-prompt with error list | drop the claim (logged as above); never emit an unverifiable citation | claim silently omitted; coverage note shown |
+| Over budget | tokens ≥ `ANALYSIS_TOKEN_BUDGET` | n/a | switch to sampled mode: signatures-only for lower-ranked files; set `sampled=true`, `coverage_pct` | coverage % banner on atlas home |
+| Chat retrieval / stream | provider 5xx / timeout | 1 retry | return retrieved citations with "couldn't summarize" template | ChatPanel shows cited files, no prose |
+
+## 9. Test mapping
 
 **M0** — T1 monorepo scaffold + compose + migrations; T2 submit form → repos row → clone in worker (s1) with progress; T3 status polling UI; T4 CI (lint, typecheck, vitest, golden-repo tarball fixtures unpack).
 **M1** — T1 tree-sitter WASM loading + symbols/imports; T2 framework registry + 8 detectors; T3 pagerank + churn (git log --numstat); T4 raw map page (file tree + ranked list + import table) — ships deterministic value; T5 stage checkpointing + resume test.

@@ -77,7 +77,7 @@ All content as data files (`content/*.json`, schema-validated in CI): towers, en
 - **M1 (2):** damage pipeline + 5 types, attribution ledger, 6 tower families, 8 species, wave generator. *Ships: competent classic TD.*
 - **M2 (3):** evolution system + threat panel + molts/traits + counter-tools; headless bot-sim balance harness. *Ships: the hook, playable.*
 - **M3 (4):** draft cards, run/meta structure, saves, recap. *Ships: roguelike loop complete.*
-- **M4 (5):** bosses, remaining species, 5 maps, difficulty tiers.
+- **M4 (5):** bosses, remaining species, 5 maps, difficulty tiers (Normal / Standard / Hard scale evolution pressure — see §11).
 - **M5 (6):** juice/SFX/colorblind pass, daily seed, replays, itch.io/web release. *Ships: v1.0 vertical slice.*
 
 ## 10. Testing & balance infrastructure
@@ -90,5 +90,5 @@ All content as data files (`content/*.json`, schema-validated in CI): towers, en
 ## 11. Risks & open questions
 
 - Balance is the real work; the bot-sim harness (M2) exists precisely so tuning is empirical, not vibes. Budget 30% of total effort post-M2 for tuning.
-- Evolution could feel punishing to new players → difficulty tiers scale `adapt_rate`, and "Normal" caps resists at 50%.
+- Evolution could feel punishing to new players → **difficulty tiers scale evolution pressure**: Normal `adapt_rate=0.07` + resist cap 50%; Standard (default) `adapt_rate=0.10` + cap 70%; Hard `adapt_rate=0.13` + cap 70%. `decay=0.03` and molt cadence (every 3rd wave) are constant across tiers. All values are @TUNE, calibrated by the M2 balance harness.
 - Phaser perf with 500+ entities → object pooling + single spritesheet from day 1; if it still binds, sim already headless → render layer swappable to Pixi without sim rewrite.

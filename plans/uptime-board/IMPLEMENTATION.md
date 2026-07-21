@@ -104,3 +104,23 @@ Full CRUD: `/monitors` (+ `POST /monitors/{id}/pause|resume|test-now`), `/channe
 ## 8. Test mapping
 
 Fault-injection suite per check type; fake-clock everywhere (hysteresis/escalation/grace/SLO); nightly compressed soak (clock-scaled 24 h, 200 monitors); Playwright: onboarding → monitor → simulated outage (faultserver flip) → webhook alert asserted → status page shows incident.
+
+## 9. Edge-case semantics & Error Recovery
+
+**Assertion chain semantics (AND, no short-circuit for reporting).** All assertions in an HTTP monitor's `assertions[]` are combined with **AND** — the check passes only if every assertion passes. There is no OR in MVP (compose two monitors if you need it). Evaluation does **not** short-circuit: every assertion is evaluated so `results.detail` records *all* failures (e.g. `[status_in: ok, body_contains: FAIL, max_latency_ms: FAIL]`), which makes alerts actionable. AC: a 3-assertion monitor with 2 failing reports both failing clauses in `detail`.
+
+**Rollup bucket-boundary assignment.** A raw result at epoch `at` belongs to bucket `floor(at / periodSec) * periodSec` (left-closed, right-open: `[bucket, bucket+periodSec)`). A result whose timestamp equals a boundary belongs to the **newer** (later) bucket. Rollup job is idempotent: it recomputes a bucket from raw results by this rule, so re-running never double-counts. AC: a result at exactly `12:01:00.000` lands in the `12:01` minute bucket, not `12:00`.
+
+**Heartbeat start-ping vs grace window.** A monitor with `track_duration` accepts two ping kinds: `start` (sets `last_start_at`) and completion (`POST|GET /hb/{slug}`, sets `last_ping_at`). Down logic: monitor is **down** when `now - last_ping_at > interval + grace_sec`. A `start` ping does **not** reset the down timer (only a completion ping does) but records run duration = `last_ping_at - last_start_at` when the next completion arrives. An orphan `start` with no completion within `interval + grace` → down with `detail="job started but never finished"`. AC covered by fake-clock suite.
+
+**Custom-domain TLS (no built-in autocert — preserves static-binary story).** The single binary does **not** embed ACME/autocert. Custom-domain status pages are matched by Host header and served over plain HTTP; TLS termination for custom domains is the operator's reverse proxy (Caddy/Traefik/nginx), documented in M3 T4's reverse-proxy guide. This keeps the "one static binary, no surprise outbound ACME calls" guarantee intact.
+
+**Error Recovery & Graceful Degradation:**
+
+| Failure | Trigger | Backoff / handling | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Alert channel send fails | `Channel.Send` returns error or times out | retry 3×, base 5 s, ×2, cap 60 s + jitter; per-(route,event) delivery is tracked | after final retry → mark route delivery `failed`, write to `alert_log`; **does not** block other routes for the same event | dashboard shows a red "delivery failed" badge on the channel + last error; next transition retries fresh |
+| Escalation route send fails | second-route `delay_sec` fires but its channel errors | same backoff as above; escalation retried independently of primary | if still failing, log + badge; recovery still cancels pending escalation | Channels page surfaces failing channel; Test button reproduces |
+| Check probe transient error | single tick fails (timeout/reset) | in-tick retry once after 10 s before counting toward `fails_to_down` | counts as one fail only after retry also fails (hysteresis N) | monitor stays `up` until N confirmed fails |
+| ICMP capability denied | `pro-bing` CAP error at startup/first ping | auto-select TCP:80 connect probe (§0) | ping monitor still functions via TCP fallback | monitor detail notes "ICMP unavailable — using TCP probe" |
+| SQLite busy/locked | WAL contention under load | rely on busy_timeout; result write retried in-tick | drop the single raw sample rather than stall scheduler; rollups self-heal from remaining raws | none (internal) |

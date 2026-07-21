@@ -76,7 +76,19 @@ CREATE INDEX results_recent ON results(upload_id);
 ## 6. Engine contracts
 
 **Signals (detect.go)** per new upload batch: (a) intra-commit disagreement: same test_id, same commit_sha, differing outcomes across uploads/attempts → strong (+3 pseudo-observations of flakiness); (b) pass-on-retry: fail in attempt n, pass in attempt n+1 same run → strong; (c) cross-commit decorrelation: fails on commits not touching test's file paths (needs changed-files metadata header `X-FD-Changed`, optional) → weak. Real-break protection: test failing consistently (≥ 3 consecutive uploads, 0 passes) post-commit X → NOT flaky; state untouched; excluded from suspected promotion (release-blocking cases in simulation).
-**stats.go**: on each result: decay α,β by `0.5^(Δt/14d)` since last_decay, then α+=isFlakySignalWeighted, β+=isCleanPass. **rename.go**: new key with ≥ 0.8 trigram similarity to a disappeared key (same suite) → link candidate, surface in UI ("possibly renamed"), never auto-merge.
+**stats.go**: on each result: decay α,β by `0.5^(Δt/14d)` since last_decay, then `α += isFlakySignalWeighted(result, signals)`, `β += isCleanPass(result) ? 1 : 0`. Signature and return type are fixed:
+
+```
+# returns pseudo-observation weight added to the flake (α) side; 0 when no flake signal
+func isFlakySignalWeighted(r Result, s Signals) float64:
+  if s.passOnRetry(r):            return 3.0   # strong
+  if s.intraCommitDisagree(r):    return 3.0   # strong
+  if s.crossCommitDecorrelate(r): return 0.5   # weak
+  if r.outcome == "fail" and s.consecutiveFails(r) >= 3: return 0.0   # real break, not flake
+  return 0.0
+```
+
+All weights and thresholds (`3.0`/`0.5`, half-life `14d`, `flake_rate ≥ 0.02`, `≥ 30 obs`, hysteresis days) are `@TUNE` and live in a single `tuning.go`; M1 T2 calibrates them against the simulation test-bed until `precision ≥ 0.9, recall ≥ 0.8 @ 30 runs, real-break FP = 0`. **rename.go**: new key with ≥ `@TUNE(renameSimilarity=0.8)` trigram similarity to a disappeared key (same suite) → link candidate, surface in UI ("possibly renamed"), never auto-merge; the 0.8 floor is tuned against the rename cases in the simulation corpus.
 
 ## 7. Milestone task lists
 
@@ -89,3 +101,31 @@ CREATE INDEX results_recent ON results(upload_id);
 ## 8. Test mapping
 
 `internal/simulation/eval_test.go` runs in CI on every engine change (the crown jewel per PLAN). Parser fixtures incl. 50 MB junit stream. Fake-clock: decay, hysteresis, recovery. Comment-rule table tests release-blocking.
+
+## 9. Simulation ground-truth schema & Error Recovery
+
+**Ground-truth labels (`internal/simulation`)** — each generated scenario emits, alongside the synthetic result stream, a label file so `eval_test.go` can score precision/recall:
+
+```
+ScenarioLabels {
+  seed:        int64                 # reproducible generation
+  tests: [ {
+    key:       string
+    truth:     "flaky" | "healthy" | "real_break"   # oracle class
+    model:     "random_p" | "time_of_day" | "order_dependent" | "infra_correlated"
+    p_flake:   float                  # for random_p models, the injected rate
+  } ]
+}
+```
+
+Scoring: a test the engine marks `confirmed`/`quarantined` counts as a positive; matched against `truth=="flaky"` for precision/recall. Any `truth=="real_break"` promoted past `suspected` is a hard failure (real-break FP = 0 gate).
+
+**Error Recovery & Graceful Degradation**
+
+| Failure | Trigger | Backoff | Fallback | User-facing UX |
+|---|---|---|---|---|
+| Malformed upload | unparseable XML/JSON or unknown `format` | no retry | reject with 422, record nothing (idempotency key not consumed) | uploader prints parse error + line; CI step can `continue-on-error` |
+| Partial batch | some test entries parse, some don't | n/a | ingest the good entries, count `skipped` in response | response `{accepted, skipped}`; upload not failed |
+| GitHub App call | 5xx / secondary rate limit | honor `Retry-After`; else 3 retries base 2s ×2 | defer comment/quarantine PR to next `workflow_run` event; state persisted | comment appears on retry; never double-posts (edits own comment) |
+| Digest send (Slack/email) | non-2xx / timeout 10s | 2 retries base 5s ×2 | drop this digest, log; next week's digest unaffected | none; dashboard still shows all data |
+| DB unavailable | pgx connection error | pool retry per driver | return 503 on ingest so CI retries upload later; no data loss | uploader retries per its own backoff |

@@ -15,7 +15,7 @@ Read `PLAN.md` first. This file fixes the implementation decisions; do not re-de
 | Collectors (MVP 6) | git, github, calendar (ICS/CalDAV), browser (chrome/firefox/safari), shell (zsh/bash/fish), note |
 | Browser read | copy DB file to temp then SQLite-read (lock avoidance); per-browser path table + version sniffing |
 | Projectizer | matchers: repo name; calendar regex; domain groups; sticky corrections in `projects.matchers_json` |
-| Citation rule | every narrative bullet carries `[e:id,…]`; validator rejects uncited → 1 regenerate → fallback to deterministic fact list for that section |
+| Citation rule | every narrative bullet carries `[e:id,…]`; validator rejects uncited → 1 regenerate → fallback to deterministic fact list for that section (see §9 for the uncitable-bullet rule) |
 | Time estimates | event-density buckets (15-min bins with any activity) + calendar busy blocks; ALWAYS rendered "≈ Nh" |
 | Reflection questions | rotating fixed list of 6 in `internal/synth/questions.go` |
 | Compile themes | `achievements` (shipped-class only), `learning` (reading+notes), `clients` (per-project rollup) |
@@ -102,3 +102,37 @@ Sections "Shipped" come from deterministic facts only (merged PRs, tags, deploy-
 ## 8. Test mapping
 
 Deterministic layers (collectors→facts) fully golden-tested on synthetic week. Privacy boundary + audit fidelity = release gates. Recorded-LLM narrative tests; nightly live smoke in all 3 modes (local via CI Ollama container).
+
+## 9. Edge-case semantics
+
+**Citation validator — uncitable bullets (exact rule).** `citations.Validate` runs per section:
+
+```
+for each section:
+  bad = bullets where cites is empty OR any id ∉ thisWeek.eventIds
+  if bad is empty: keep section as-is
+  else:
+    regenerate section once (prompt includes the offending bullets + "every bullet MUST cite")
+    re-validate:
+      if now clean: keep
+      else: DROP the still-uncited bullets; if that empties the section,
+            replace the whole section with the deterministic fact list for that section
+```
+
+So a single uncitable bullet is dropped (not the whole section); only a fully-uncitable section degrades to facts. AC: a narrative with one hallucinated bullet renders the rest + drops that bullet; a wholly-uncited section renders the fact list.
+
+**Mask determinism for FTS.** Masking is applied deterministically **before storage** for `drop` rules and **before LLM** for `mask` rules — but the FTS index is built from stored events, which retain original text (local-only DB, privacy covenant permits this since it never leaves the machine). Masking is therefore never applied to the FTS content, so search stays consistent and complete. The redact boundary only governs what crosses the LLM/cloud boundary (tested by the §7 M2 boundary test), not what the local index contains. AC: searching a masked term still finds the local event; the cloud payload fixture contains zero occurrences of it.
+
+**Project matcher stickiness scope.** Rewind is a single-user local tool, so "user scope" = the whole install. A sticky correction (user manually reassigns an event's project) is stored in `projects.matchers_json` as an explicit event-hash pin and **always wins** over regex/domain matchers, globally and for future weeks, until removed. AC: reassigning one event keeps every matching future event on that project.
+
+**Time-estimate bin boundaries (non-overlapping).** 15-minute bins are half-open `[binStart, binStart+15m)` aligned to the local-time hour; an event at exactly a boundary belongs to the **later** bin. A bin counts as active if ≥1 event falls in it; `≈ hours = activeBins × 15m` rounded to the nearest 0.5 h. Calendar busy blocks union with activity bins (no double-count of an overlapping bin). AC: an event at `10:15:00` lands in the `10:15` bin, not `10:00`.
+
+**Browser schema-version coverage (enumerated).** `browser/paths.go` carries an explicit table; unknown/newer versions fall back to the latest known schema for that browser and emit a warning event rather than failing:
+
+| Browser | DB file | Known schema range (MVP) | Unknown-version behavior |
+|---|---|---|---|
+| Chrome/Chromium | `History` (SQLite) | Chrome 90–current `urls`/`visits` layout | try latest-known query; warn event on error |
+| Firefox | `places.sqlite` | `moz_places`/`moz_historyvisits` (FF 80+) | same fallback + warn |
+| Safari | `History.db` | `history_items`/`history_visits` (macOS 11+) | same fallback + warn; TCC-denied → doctor flag |
+
+Fixtures under `fixtures/browsers/` include one DB file per listed schema; the collector is tested against each and against a synthetic "unknown version" file to prove graceful degradation.
